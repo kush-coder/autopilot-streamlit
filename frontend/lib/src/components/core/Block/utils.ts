@@ -1,0 +1,283 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+import { type Block as BlockProto, streamlit } from "@streamlit/protobuf"
+
+import { type AppNode, BlockNode } from "~lib/AppNode"
+import { Direction } from "~lib/components/core/Layout/utils"
+import type { ComponentRegistry } from "~lib/components/widgets/CustomComponent/ComponentRegistry"
+import type { FileUploadClient } from "~lib/FileUploadClient"
+import { ElementsSetVisitor } from "~lib/render-tree/visitors/ElementsSetVisitor"
+import { ScriptRunState } from "~lib/ScriptRunState"
+import type { StreamlitEndpoints } from "~lib/StreamlitEndpoints"
+import { getDividerColors } from "~lib/theme/getColors"
+import type { EmotionTheme } from "~lib/theme/types"
+import { isValidElementId } from "~lib/util/utils"
+import type { WidgetStateManager } from "~lib/WidgetStateManager"
+
+export function getClassnamePrefix(direction: Direction): string {
+  return direction === Direction.HORIZONTAL
+    ? "stHorizontalBlock"
+    : "stVerticalBlock"
+}
+
+// Only RUNNING: during a pending stop, placeholder updates should still be
+// allowed to render.
+export function shouldComponentBeEnabled(
+  elementType: string,
+  scriptRunState: ScriptRunState
+): boolean {
+  return elementType !== "empty" || scriptRunState !== ScriptRunState.RUNNING
+}
+
+export function isElementStale(
+  node: AppNode,
+  scriptRunState: ScriptRunState,
+  scriptRunId: string,
+  fragmentIdsThisRun?: Array<string>
+): boolean {
+  if (scriptRunState === ScriptRunState.RERUN_REQUESTED) {
+    // If a rerun was just requested, all of our current elements
+    // are about to become stale.
+    return true
+  }
+
+  // STOP_REQUESTED means the user asked to stop but the script is still
+  // executing, so elements from earlier runs must stay stale until the run
+  // actually finishes.
+  if (
+    scriptRunState === ScriptRunState.RUNNING ||
+    scriptRunState === ScriptRunState.STOP_REQUESTED
+  ) {
+    if (fragmentIdsThisRun?.length) {
+      // if the fragmentId is set, we only want to mark elements as stale
+      // that belong to the same fragmentId and have a different scriptRunId.
+      // If they have the same scriptRunId, they were just updated.
+      return Boolean(
+        node.fragmentId &&
+        fragmentIdsThisRun.includes(node.fragmentId) &&
+        node.scriptRunId !== scriptRunId
+      )
+    }
+    return node.scriptRunId !== scriptRunId
+  }
+
+  return false
+}
+
+export function isComponentStale(
+  enable: boolean,
+  node: AppNode,
+  scriptRunState: ScriptRunState,
+  scriptRunId: string,
+  fragmentIdsThisRun?: Array<string>
+): boolean {
+  return (
+    !enable ||
+    isElementStale(node, scriptRunState, scriptRunId, fragmentIdsThisRun)
+  )
+}
+
+/**
+ * Whether a leftover dialog from a previous full-app run should be hidden.
+ *
+ * Stale nodes are only pruned after the script finishes successfully, so a
+ * dialog closed via `st.rerun()` would otherwise stay on screen for the whole
+ * next run (issue #9405).
+ *
+ * Any fragment rerun keeps the dialog: unlike {@link isElementStale}, this
+ * does not check whether the node's `fragmentId` is in `fragmentIdsThisRun`.
+ * Fragment `newSession` still assigns a new `scriptRunId`, so hiding on
+ * mismatch would also close the dialog when an unrelated fragment refreshes.
+ *
+ * `RERUN_REQUESTED` also keeps it. That state is set before we know whether
+ * the next run is a fragment or full-app rerun; hiding here would unmount
+ * the dialog on every widget interaction inside it.
+ *
+ * Not the same as {@link isElementStale}: that function marks every element
+ * stale on `RERUN_REQUESTED`.
+ */
+export function shouldHideStaleDialog(
+  node: AppNode,
+  scriptRunState: ScriptRunState,
+  scriptRunId: string,
+  fragmentIdsThisRun?: Array<string>
+): boolean {
+  if (fragmentIdsThisRun?.length) {
+    return false
+  }
+
+  if (
+    scriptRunState !== ScriptRunState.RUNNING &&
+    scriptRunState !== ScriptRunState.STOP_REQUESTED
+  ) {
+    return false
+  }
+
+  return node.scriptRunId !== scriptRunId
+}
+
+export function assignDividerColor(
+  node: BlockNode,
+  theme: EmotionTheme
+): void {
+  // All available divider colors
+  const allColorMap = getDividerColors(theme)
+  const allColorKeys = Object.keys(allColorMap)
+
+  // Limited colors for auto assignment - exclude gray/grey & rainbow
+  const { blue, green, orange, red, violet, yellow } = allColorMap
+  const autoColorMap = { blue, green, orange, red, violet, yellow }
+  const autoColorKeys = Object.keys(autoColorMap)
+  let dividerIndex = 0
+
+  for (const element of ElementsSetVisitor.collectElements(node)) {
+    const divider = element.heading?.divider
+    if (element.type === "heading" && divider) {
+      if (divider === "auto") {
+        const colorKey = autoColorKeys[dividerIndex]
+        // @ts-expect-error - colorKey is a string, and heading is not narrowed
+        element.heading.divider = autoColorMap[colorKey]
+        dividerIndex += 1
+        if (dividerIndex === autoColorKeys.length) dividerIndex = 0
+      } else if (allColorKeys.includes(divider)) {
+        // @ts-expect-error - divider is a string, and heading is not narrowed
+        element.heading.divider = allColorMap[divider]
+      }
+    }
+  }
+}
+export interface BaseBlockProps {
+  /**
+   * The app's StreamlitEndpoints instance. Exposes non-websocket endpoint logic
+   * used by various Streamlit elements.
+   */
+  endpoints: StreamlitEndpoints
+
+  /**
+   * The app's WidgetStateManager instance. Used by all widget elements to
+   * store and retrieve widget state. When the user interacts with a widget,
+   * the WidgetStateManager initiates the "rerun BackMsg" data flow to kick
+   * off a script rerun.
+   */
+  widgetMgr: WidgetStateManager
+
+  /**
+   * The app's FileUploadClient instance. Used by the FileUploader component
+   * to send files to the Streamlit backend.
+   */
+  uploadClient: FileUploadClient
+
+  /**
+   * If true, all widgets will be disabled and the app will be non-interactive.
+   * This is generally set when the frontend is disconnected from the backend.
+   */
+  widgetsDisabled: boolean
+
+  /**
+   * If true , the element should not allow going into fullscreen. Right now we plan
+   * to use it, for example, in Dialogs to prevent fullscreen issues.
+   */
+  disableFullscreenMode?: boolean
+
+  /**
+   * The app's ComponentRegistry instance. Dispatches "Custom Component"
+   * iframe messages to ComponentInstances.
+   */
+  componentRegistry: ComponentRegistry
+}
+
+/**
+ * Converts a user-specified key to a valid CSS class name.
+ *
+ * @param key - The key to convert.
+ * @returns A valid CSS class name.
+ */
+export function convertKeyToClassName(key: string | undefined | null): string {
+  if (!key) {
+    return ""
+  }
+  const className = key.trim().replaceAll(/[^a-zA-Z0-9_-]/g, "-")
+  return "st-key-" + className
+}
+
+/**
+ * Returns the user-specified key extracted from the element id, or undefined if the id does
+ * not have a user-specified key.
+ */
+export function getKeyFromId(
+  elementId: string | undefined | null
+): string | undefined {
+  if (!elementId || !isValidElementId(elementId)) {
+    return undefined
+  }
+
+  // Split the elementId by hyphens
+  const parts = elementId.split("-")
+  // Extract all parts after the second hyphen
+  const userKey = parts.slice(2).join("-")
+  return userKey === "None" ? undefined : userKey
+}
+
+export function getColumnGapConfig(
+  columnProto: BlockProto.Column.$Properties
+): streamlit.GapConfig.$Properties {
+  const gapConfig = columnProto.gapConfig
+  if (typeof gapConfig?.pixelGap === "number") {
+    return { pixelGap: gapConfig.pixelGap }
+  }
+  if (gapConfig?.gapSize) {
+    return { gapSize: gapConfig.gapSize }
+  }
+  return { gapSize: streamlit.GapSize.SMALL }
+}
+
+export function checkFlexContainerBackwardsCompatibile(
+  blockProto: BlockProto
+): boolean {
+  if (
+    blockProto.flexContainer ||
+    blockProto.vertical ||
+    blockProto.horizontal
+  ) {
+    return true
+  }
+  return false
+}
+
+export function shouldActivateScrollToBottom(blockNode: BlockNode): boolean {
+  const hasFixedPixelHeight = blockNode.deltaBlock.heightConfig?.pixelHeight
+  if (!hasFixedPixelHeight) {
+    return false
+  }
+
+  // When autoscroll is explicitly set, use that value directly.
+  const { autoscroll } = blockNode.deltaBlock
+  if (autoscroll !== null && autoscroll !== undefined) {
+    return autoscroll
+  }
+
+  // Default: auto-scroll when container has chat messages.
+  return blockNode.children.some(
+    node => node instanceof BlockNode && node.deltaBlock.type === "chatMessage"
+  )
+}
+
+export function getBorderBackwardsCompatible(blockProto: BlockProto): boolean {
+  return (
+    blockProto.flexContainer?.border === true ||
+    blockProto.vertical?.border === true
+  )
+}

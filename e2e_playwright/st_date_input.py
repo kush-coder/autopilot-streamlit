@@ -1,0 +1,311 @@
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from datetime import date, datetime
+
+import streamlit as st
+from streamlit import runtime
+
+leading_indent_regular_text_tooltip = """
+This is a regular text block!
+Test1
+Test2
+
+"""
+
+v1 = st.date_input(
+    "Single date",
+    date(1970, 1, 1),
+    min_value=date(1970, 1, 1),
+    help=leading_indent_regular_text_tooltip,
+)
+st.write("Value 1:", v1)
+
+v2 = st.date_input("Single datetime", datetime(2019, 7, 6, 21, 15), help="Help text")
+st.write("Value 2:", v2)
+
+v3 = st.date_input("Range, no date", [])
+st.write("Value 3:", v3)
+
+v4 = st.date_input("Range, one date", [date(2019, 7, 6)])
+st.write("Value 4:", v4)
+
+v5 = st.date_input("Range, two dates", [date(2019, 7, 6), date(2019, 7, 8)])
+st.write("Value 5:", v5)
+
+v6 = st.date_input("Disabled, no date", [], disabled=True)
+st.write("Value 6:", v6)
+
+v7 = st.date_input(
+    "Label hidden",
+    datetime(2019, 7, 6, 21, 15),
+    label_visibility="hidden",
+    key="date_input_7",
+)
+st.write("Value 7:", v7)
+
+v8 = st.date_input(
+    "Label collapsed",
+    datetime(2019, 7, 6, 21, 15),
+    label_visibility="collapsed",
+    key="date_input_8",
+)
+st.write("Value 8:", v8)
+
+v9 = st.date_input("Single date with format", date(1970, 1, 1), format="MM-DD-YYYY")
+st.write("Value 9:", v9)
+
+v10 = st.date_input(
+    "Range, two dates with format",
+    [date(2019, 7, 6), date(2019, 7, 8)],
+    format="MM/DD/YYYY",
+)
+st.write("Value 10:", v10)
+
+v11 = st.date_input("Range, no date with format", [], format="DD.MM.YYYY")
+st.write("Value 11:", v11)
+
+
+if runtime.exists():
+
+    def on_change():
+        st.session_state.date_input_changed = True
+        st.text("Date input changed callback")
+
+    st.date_input(
+        "Single date with callback",
+        date(1970, 1, 1),
+        min_value=date(1970, 1, 1),
+        key="date_input_12",
+        on_change=on_change,
+    )
+    st.write("Value 12:", st.session_state.date_input_12)
+    st.write("Date Input Changed:", st.session_state.get("date_input_changed") is True)
+    # Reset to False:
+    st.session_state.date_input_changed = False
+
+v13 = st.date_input("Empty value", value=None)
+st.write("Value 13:", v13)
+
+if "date_input_14" not in st.session_state:
+    st.session_state["date_input_14"] = date(1970, 2, 3)
+
+v14 = st.date_input(
+    "Value from state",
+    value=None,
+    key="date_input_14",
+)
+st.write("Value 14:", v14)
+
+st.date_input(
+    "date input 15 -> :material/check: :rainbow[Fancy] _**markdown** `label` _support_",
+    date(1970, 1, 1),
+    key="date_input_15",
+)
+
+st.date_input("Date input 16 (width=200px)", date(1970, 1, 1), width=200)
+st.date_input("Date input 17 (width='stretch')", date(1970, 1, 1), width="stretch")
+
+with st.form("date_form", clear_on_submit=True):
+    single_form_value = st.date_input(
+        "Single date in form", value=None, key="single_date_form_input"
+    )
+    range_form_value = st.date_input(
+        "Range date in form", value=[], key="range_date_form_input"
+    )
+    form_submitted = st.form_submit_button("Submit date form")
+    if form_submitted:
+        st.write("Single date form value:", single_form_value)
+        st.write("Range date form value:", range_form_value)
+
+st.write("""This is a block of text. We can click on it to
+         trigger a click outside of the element to submit the value.""")
+
+# --- Bound widgets (query-params) ---
+
+bound_single = st.date_input(
+    "Bound single date",
+    value=date(2025, 1, 15),
+    key="bound_date",
+    bind="query-params",
+)
+st.write("Bound date:", bound_single)
+
+bound_clearable = st.date_input(
+    "Bound clearable date",
+    value=None,
+    key="bound_clearable_date",
+    bind="query-params",
+)
+st.write("Bound clearable date:", bound_clearable)
+
+bound_range = st.date_input(
+    "Bound date range",
+    value=[date(2025, 3, 1), date(2025, 3, 15)],
+    key="bound_range",
+    bind="query-params",
+)
+st.write("Bound range:", bound_range)
+
+bound_minmax = st.date_input(
+    "Bound with bounds",
+    value=date(2025, 6, 15),
+    min_value=date(2025, 1, 1),
+    max_value=date(2025, 12, 31),
+    key="bound_minmax_date",
+    bind="query-params",
+)
+st.write("Bound minmax:", bound_minmax)
+
+st.date_input(
+    "Narrow single",
+    date(2019, 7, 6),
+    width=85,
+    key="narrow_single",
+)
+st.date_input(
+    "Narrow range",
+    [date(2019, 7, 6), date(2019, 7, 20)],
+    width=150,
+    key="narrow_range",
+)
+st.date_input(
+    "Narrow clearable bounded",
+    value=None,
+    min_value=date(2020, 1, 1),
+    max_value=date(2020, 12, 31),
+    width=110,
+    key="narrow_clearable_bounded",
+)
+
+if st.toggle("Update date input props"):
+    dval = st.date_input(
+        "Updated dynamic date input",
+        value=date(2023, 9, 10),
+        width=300,
+        help="updated help",
+        on_change=lambda a, param: print(
+            f"Updated date input - callback triggered: {a} {param}"
+        ),
+        args=("Updated date arg",),
+        kwargs={"param": "updated kwarg param"},
+        key="dynamic_date_input_with_key",
+        min_value=date(2020, 1, 1),
+        max_value=date(2025, 1, 1),
+        # Whitelisted kwargs:
+        format="YYYY/MM/DD",
+    )
+    st.write("Updated date input value:", dval)
+else:
+    dval = st.date_input(
+        "Initial dynamic date input",
+        value=date(2020, 1, 1),
+        width="stretch",
+        help="initial help",
+        on_change=lambda a, param: print(
+            f"Initial date input - callback triggered: {a} {param}"
+        ),
+        args=("Initial date arg",),
+        kwargs={"param": "initial kwarg param"},
+        key="dynamic_date_input_with_key",
+        min_value=date(2010, 1, 1),
+        max_value=date(2030, 1, 1),
+        # Whitelisted kwargs:
+        format="YYYY/MM/DD",
+    )
+    st.write("Initial date input value:", dval)
+
+# --- Year-crossing bounds (see GitHub issue #16686) ---
+# `max_value`'s month/day precedes `min_value`'s, so the calendar header's year
+# dropdown must still offer the later year.
+st.date_input(
+    "Year-crossing single",
+    value=date(2025, 2, 1),
+    min_value=date(2024, 8, 3),
+    max_value=date(2025, 2, 3),
+)
+st.date_input(
+    "Year-crossing range",
+    value=[date(2025, 2, 1), date(2025, 2, 2)],
+    min_value=date(2024, 8, 3),
+    max_value=date(2025, 2, 3),
+)
+
+# --- on_change="ignore" date input ---
+# Run counter so test_date_input_on_change_ignore can detect an unexpected rerun.
+if "runs" not in st.session_state:
+    st.session_state.runs = 0
+st.session_state.runs += 1
+st.write("Runs:", st.session_state.runs)
+
+ignore_date = st.date_input(
+    "Ignore change date input",
+    value=date(2025, 1, 15),
+    min_value=date(2024, 1, 1),
+    max_value=date(2026, 12, 31),
+    key="ignore_date",
+    on_change="ignore",
+    bind="query-params",
+)
+st.write("Ignore date value:", ignore_date)
+
+# Sidebar keeps Apply out from under the calendar overlay so a type-then-click
+# can blur-commit the dirty field and rerun in one action.
+if st.sidebar.button("Apply ignore date", key="apply_ignore_date"):
+    st.write("Applied ignore date value:", ignore_date)
+
+st.markdown("Required date inputs:")
+
+with st.form("required_date_input_form", clear_on_submit=True):
+    st.date_input(
+        "Required date",
+        value=None,
+        key="required_date",
+        required=True,
+    )
+    st.date_input(
+        "Required range",
+        value=[],
+        key="required_range",
+        required=True,
+    )
+    required_form_submitted = st.form_submit_button("Submit required date input form")
+
+st.write("required form submitted:", required_form_submitted)
+st.write("required date:", st.session_state.get("required_date"))
+st.write("required range:", st.session_state.get("required_range"))
+
+required_standalone = st.date_input(
+    "Required standalone",
+    value=None,
+    key="required_standalone",
+    required=True,
+)
+st.write("required standalone:", required_standalone)
+
+required_standalone_range = st.date_input(
+    "Required standalone range",
+    value=[],
+    key="required_standalone_range",
+    required=True,
+)
+st.write("required standalone range:", required_standalone_range)
+
+st.date_input(
+    "Required hidden",
+    value=None,
+    key="required_hidden",
+    required=True,
+    label_visibility="hidden",
+)

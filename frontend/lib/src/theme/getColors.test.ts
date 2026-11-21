@@ -1,0 +1,474 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { transparentize } from "color2k"
+
+import { darkTheme, lightTheme } from "~lib/theme/themeConfigs"
+
+import {
+  computeDerivedColors,
+  getDividerColors,
+  getMarkdownTextColors,
+  getThemeBackgroundColors,
+  hasLightBackgroundColor,
+  resolveNamedBackgroundColor,
+  resolveNamedColor,
+} from "./getColors"
+
+describe("computeDerivedColors", () => {
+  it.each([
+    ["light", lightTheme],
+    ["dark", darkTheme],
+  ])("derives the darkenedBgMix opacity variants for %s theme", (_, theme) => {
+    const result = computeDerivedColors(theme.emotion.colors)
+
+    // The darkenedBgMixXX tokens are darkenedBgMix100 at decreasing opacity
+    // (the number suffix is the approximate opacity percentage).
+    expect(result.darkenedBgMix40).toBe(
+      transparentize(result.darkenedBgMix100, 0.6)
+    )
+    expect(result.darkenedBgMix25).toBe(
+      transparentize(result.darkenedBgMix100, 0.75)
+    )
+    expect(result.darkenedBgMix15).toBe(
+      transparentize(result.darkenedBgMix100, 0.85)
+    )
+
+    // darkenedBgMix40 is more opaque (less transparent) than darkenedBgMix25.
+    expect(result.darkenedBgMix40).not.toBe(result.darkenedBgMix25)
+  })
+
+  it.each([
+    ["light", lightTheme],
+    ["dark", darkTheme],
+  ])(
+    "derives fadedText60 and fadedText70 from bodyText for %s theme",
+    (_, theme) => {
+      const { bodyText } = theme.emotion.colors
+      const result = computeDerivedColors(theme.emotion.colors)
+
+      // The token suffix is the bodyText opacity percentage.
+      expect(result.fadedText60).toBe(transparentize(bodyText, 0.4))
+      expect(result.fadedText70).toBe(transparentize(bodyText, 0.3))
+    }
+  )
+})
+
+describe("getDividerColors", () => {
+  describe("light theme", () => {
+    it("returns the default divider colors for the light theme", () => {
+      expect(hasLightBackgroundColor(lightTheme.emotion)).toBe(true)
+      const result = getDividerColors(lightTheme.emotion)
+
+      expect(result.red).toBe("#D94A57")
+      expect(result.orange).toBe("#E0682B")
+      expect(result.yellow).toBe("#BB8300")
+      expect(result.blue).toBe("#3B82F6")
+      expect(result.green).toBe("#079464")
+      expect(result.violet).toBe("#9B5DE5")
+      expect(result.gray).toBe("#6B7280")
+      expect(result.grey).toBe("#6B7280")
+      expect(result.rainbow).toBe(
+        "linear-gradient(to right, #D94A57, #E0682B, #BB8300, #079464, #3B82F6, #9B5DE5)"
+      )
+    })
+
+    it("matches the default theme colors", () => {
+      const result = getDividerColors(lightTheme.emotion)
+      const colors = lightTheme.emotion.colors
+
+      expect(result.red).toBe(colors.redColor)
+      expect(result.orange).toBe(colors.orangeColor)
+      expect(result.yellow).toBe(colors.yellowColor)
+      expect(result.blue).toBe(colors.blueColor)
+      expect(result.green).toBe(colors.greenColor)
+      expect(result.violet).toBe(colors.violetColor)
+      expect(result.gray).toBe(colors.grayColor)
+      expect(result.grey).toBe(colors.grayColor)
+      expect(result.rainbow).toBe(
+        `linear-gradient(to right, ${colors.redColor}, ${colors.orangeColor}, ${colors.yellowColor}, ${colors.greenColor}, ${colors.blueColor}, ${colors.violetColor})`
+      )
+
+      // Verify all colors are valid hex strings (excluding rainbow which is a gradient)
+      const colorEntries = Object.entries(result).filter(
+        ([key]) => key !== "rainbow"
+      )
+      colorEntries.forEach(([_, value]) => {
+        expect(value).toMatch(/^#[0-9a-fA-F]{6}$/)
+      })
+    })
+
+    it("gray and grey properties are identical", () => {
+      const result = getDividerColors(lightTheme.emotion)
+      expect(result.gray).toBe(result.grey)
+    })
+
+    it("rainbow gradient contains all colors in consistent order", () => {
+      const result = getDividerColors(lightTheme.emotion)
+      const expectedOrder = [
+        result.red,
+        result.orange,
+        result.yellow,
+        result.green,
+        result.blue,
+        result.violet,
+      ]
+
+      expect(result.rainbow).toBe(
+        "linear-gradient(to right, #D94A57, #E0682B, #BB8300, #079464, #3B82F6, #9B5DE5)"
+      )
+      const gradientColors = result.rainbow.match(/#[0-9a-fA-F]{6}/g)
+      expect(gradientColors).toEqual(expectedOrder)
+    })
+  })
+
+  describe("dark theme", () => {
+    it("returns the default divider colors for the dark theme", () => {
+      expect(hasLightBackgroundColor(darkTheme.emotion)).toBe(false)
+      const result = getDividerColors(darkTheme.emotion)
+
+      expect(result.red).toBe("#F2919A")
+      expect(result.orange).toBe("#F2A56D")
+      expect(result.yellow).toBe("#FBD54F")
+      expect(result.blue).toBe("#85B8F8")
+      expect(result.green).toBe("#7ED5B0")
+      expect(result.violet).toBe("#BF8EF7")
+      expect(result.gray).toBe("#A9A5A0")
+      expect(result.grey).toBe("#A9A5A0")
+      expect(result.rainbow).toBe(
+        "linear-gradient(to right, #F2919A, #F2A56D, #FBD54F, #7ED5B0, #85B8F8, #BF8EF7)"
+      )
+    })
+
+    it("matches the default theme colors", () => {
+      const result = getDividerColors(darkTheme.emotion)
+      const colors = darkTheme.emotion.colors
+
+      expect(result.red).toBe(colors.redColor)
+      expect(result.orange).toBe(colors.orangeColor)
+      expect(result.yellow).toBe(colors.yellowColor)
+      expect(result.blue).toBe(colors.blueColor)
+      expect(result.green).toBe(colors.greenColor)
+      expect(result.violet).toBe(colors.violetColor)
+      expect(result.gray).toBe(colors.grayColor)
+      expect(result.grey).toBe(colors.grayColor)
+      expect(result.rainbow).toBe(
+        `linear-gradient(to right, ${colors.redColor}, ${colors.orangeColor}, ${colors.yellowColor}, ${colors.greenColor}, ${colors.blueColor}, ${colors.violetColor})`
+      )
+
+      // Verify all colors are valid hex strings (excluding rainbow which is a gradient)
+      const colorEntries = Object.entries(result).filter(
+        ([key]) => key !== "rainbow"
+      )
+      colorEntries.forEach(([_, value]) => {
+        expect(value).toMatch(/^#[0-9a-fA-F]{6}$/)
+      })
+    })
+
+    it("gray and grey properties are identical", () => {
+      const result = getDividerColors(darkTheme.emotion)
+      expect(result.gray).toBe(result.grey)
+    })
+
+    it("rainbow gradient contains all colors in consistent order", () => {
+      const result = getDividerColors(darkTheme.emotion)
+      const expectedOrder = [
+        result.red,
+        result.orange,
+        result.yellow,
+        result.green,
+        result.blue,
+        result.violet,
+      ]
+
+      expect(result.rainbow).toBe(
+        "linear-gradient(to right, #F2919A, #F2A56D, #FBD54F, #7ED5B0, #85B8F8, #BF8EF7)"
+      )
+      const gradientColors = result.rainbow.match(/#[0-9a-fA-F]{6}/g)
+      expect(gradientColors).toEqual(expectedOrder)
+    })
+  })
+})
+
+describe("getThemeBackgroundColors", () => {
+  it("returns correct background colors for light theme", () => {
+    const result = getThemeBackgroundColors(lightTheme.emotion)
+    const colors = lightTheme.emotion.colors
+
+    expect(result.redbg).toBe("#FFF1F2")
+    expect(result.orangebg).toBe("#FFF6ED")
+    expect(result.yellowbg).toBe("#FFFAE5")
+    expect(result.bluebg).toBe("#EDF5FF")
+    expect(result.greenbg).toBe("#F1FBF6")
+    expect(result.violetbg).toBe("#F8F2FF")
+    expect(result.graybg).toBe("#F5F4F2")
+    expect(result.redbg).toBe(colors.redBackgroundColor)
+    expect(result.orangebg).toBe(colors.orangeBackgroundColor)
+    expect(result.yellowbg).toBe(colors.yellowBackgroundColor)
+    expect(result.bluebg).toBe(colors.blueBackgroundColor)
+    expect(result.greenbg).toBe(colors.greenBackgroundColor)
+    expect(result.violetbg).toBe(colors.violetBackgroundColor)
+    expect(result.graybg).toBe(colors.grayBackgroundColor)
+    expect(result.purplebg).toBe(transparentize(colors.purple90, 0.9))
+    expect(result.primarybg).toBe(transparentize(colors.primary, 0.9))
+  })
+
+  it("returns correct background colors for dark theme", () => {
+    const result = getThemeBackgroundColors(darkTheme.emotion)
+    const colors = darkTheme.emotion.colors
+
+    expect(result.redbg).toBe("#412023")
+    expect(result.orangebg).toBe("#342414")
+    expect(result.yellowbg).toBe("#302917")
+    expect(result.bluebg).toBe("#1E2A3D")
+    expect(result.greenbg).toBe("#0E2F24")
+    expect(result.violetbg).toBe("#332244")
+    expect(result.graybg).toBe("#2C2925")
+    expect(result.redbg).toBe(colors.redBackgroundColor)
+    expect(result.orangebg).toBe(colors.orangeBackgroundColor)
+    expect(result.yellowbg).toBe(colors.yellowBackgroundColor)
+    expect(result.bluebg).toBe(colors.blueBackgroundColor)
+    expect(result.greenbg).toBe(colors.greenBackgroundColor)
+    expect(result.violetbg).toBe(colors.violetBackgroundColor)
+    expect(result.graybg).toBe(colors.grayBackgroundColor)
+    expect(result.purplebg).toBe(transparentize(colors.purple80, 0.7))
+    expect(result.primarybg).toBe(transparentize(colors.primary, 0.7))
+  })
+})
+
+describe("getMarkdownTextColors", () => {
+  it("returns correct text colors for light theme", () => {
+    const result = getMarkdownTextColors(lightTheme.emotion)
+    const colors = lightTheme.emotion.colors
+
+    expect(result.red).toBe("#9E303B")
+    expect(result.orange).toBe("#9B4519")
+    expect(result.yellow).toBe("#956B0F")
+    expect(result.blue).toBe("#244FB4")
+    expect(result.green).toBe("#0C5A44")
+    expect(result.violet).toBe("#6F33B8")
+    expect(result.gray).toBe("#686255")
+    expect(result.red).toBe(colors.redTextColor)
+    expect(result.orange).toBe(colors.orangeTextColor)
+    expect(result.yellow).toBe(colors.yellowTextColor)
+    expect(result.blue).toBe(colors.blueTextColor)
+    expect(result.green).toBe(colors.greenTextColor)
+    expect(result.violet).toBe(colors.violetTextColor)
+    expect(result.purple).toBe(colors.purple100)
+    expect(result.gray).toBe(colors.grayTextColor)
+    expect(result.primary).toBe(colors.primary)
+  })
+
+  it("returns correct text colors for dark theme", () => {
+    const result = getMarkdownTextColors(darkTheme.emotion)
+    const colors = darkTheme.emotion.colors
+
+    expect(result.red).toBe("#F2919A")
+    expect(result.orange).toBe("#F2A56D")
+    expect(result.yellow).toBe("#FBD54F")
+    expect(result.blue).toBe("#85B8F8")
+    expect(result.green).toBe("#7ED5B0")
+    expect(result.violet).toBe("#BF8EF7")
+    expect(result.gray).toBe("#B8B3A8")
+    expect(result.red).toBe(colors.redTextColor)
+    expect(result.orange).toBe(colors.orangeTextColor)
+    expect(result.yellow).toBe(colors.yellowTextColor)
+    expect(result.blue).toBe(colors.blueTextColor)
+    expect(result.green).toBe(colors.greenTextColor)
+    expect(result.violet).toBe(colors.violetTextColor)
+    expect(result.purple).toBe(colors.purple80)
+    expect(result.gray).toBe(colors.grayTextColor)
+    expect(result.primary).toBe(colors.primary)
+  })
+})
+
+// Note: Tests for NAMED_COLORS and isNamedColor are in namedColors.test.ts
+// This file only tests functions defined in getColors.ts
+
+describe("resolveNamedColor", () => {
+  it("resolves builtin color names to theme colors for light theme", () => {
+    const colors = lightTheme.emotion.colors
+
+    expect(resolveNamedColor("red", lightTheme.emotion)).toBe(colors.redColor)
+    expect(resolveNamedColor("orange", lightTheme.emotion)).toBe(
+      colors.orangeColor
+    )
+    expect(resolveNamedColor("yellow", lightTheme.emotion)).toBe(
+      colors.yellowColor
+    )
+    expect(resolveNamedColor("green", lightTheme.emotion)).toBe(
+      colors.greenColor
+    )
+    expect(resolveNamedColor("blue", lightTheme.emotion)).toBe(
+      colors.blueColor
+    )
+    expect(resolveNamedColor("violet", lightTheme.emotion)).toBe(
+      colors.violetColor
+    )
+    expect(resolveNamedColor("gray", lightTheme.emotion)).toBe(
+      colors.grayColor
+    )
+    expect(resolveNamedColor("grey", lightTheme.emotion)).toBe(
+      colors.grayColor
+    )
+    expect(resolveNamedColor("primary", lightTheme.emotion)).toBe(
+      colors.primary
+    )
+  })
+
+  it("resolves builtin color names to theme colors for dark theme", () => {
+    const colors = darkTheme.emotion.colors
+
+    expect(resolveNamedColor("red", darkTheme.emotion)).toBe(colors.redColor)
+    expect(resolveNamedColor("blue", darkTheme.emotion)).toBe(colors.blueColor)
+    expect(resolveNamedColor("primary", darkTheme.emotion)).toBe(
+      colors.primary
+    )
+  })
+
+  it("handles case-insensitive color names", () => {
+    const colors = lightTheme.emotion.colors
+
+    expect(resolveNamedColor("RED", lightTheme.emotion)).toBe(colors.redColor)
+    expect(resolveNamedColor("Blue", lightTheme.emotion)).toBe(
+      colors.blueColor
+    )
+    expect(resolveNamedColor("PRIMARY", lightTheme.emotion)).toBe(
+      colors.primary
+    )
+  })
+
+  it("returns non-builtin colors unchanged", () => {
+    expect(resolveNamedColor("#ff0000", lightTheme.emotion)).toBe("#ff0000")
+    expect(resolveNamedColor("pink", lightTheme.emotion)).toBe("pink")
+    expect(resolveNamedColor("rgb(255, 0, 0)", lightTheme.emotion)).toBe(
+      "rgb(255, 0, 0)"
+    )
+  })
+
+  it("does not resolve purple (no purpleColor exists, use violet instead)", () => {
+    // "purple" is not a built-in color name - it passes through unchanged
+    // This differs from resolveNamedBackgroundColor which DOES support "purple"
+    expect(resolveNamedColor("purple", lightTheme.emotion)).toBe("purple")
+
+    // Use "violet" for the main color
+    expect(resolveNamedColor("violet", lightTheme.emotion)).toBe(
+      lightTheme.emotion.colors.violetColor
+    )
+  })
+
+  it("returns consistent results on repeated calls (memoization)", () => {
+    // First call
+    const result1 = resolveNamedColor("red", lightTheme.emotion)
+    // Second call should return the same value
+    const result2 = resolveNamedColor("red", lightTheme.emotion)
+    expect(result1).toBe(result2)
+
+    // Different color, same theme
+    const result3 = resolveNamedColor("blue", lightTheme.emotion)
+    expect(result3).toBe(lightTheme.emotion.colors.blueColor)
+  })
+})
+
+describe("resolveNamedBackgroundColor", () => {
+  it("resolves builtin color names to background colors for light theme", () => {
+    const bgColors = getThemeBackgroundColors(lightTheme.emotion)
+
+    expect(resolveNamedBackgroundColor("red", lightTheme.emotion)).toBe(
+      bgColors.redbg
+    )
+    expect(resolveNamedBackgroundColor("orange", lightTheme.emotion)).toBe(
+      bgColors.orangebg
+    )
+    expect(resolveNamedBackgroundColor("yellow", lightTheme.emotion)).toBe(
+      bgColors.yellowbg
+    )
+    expect(resolveNamedBackgroundColor("green", lightTheme.emotion)).toBe(
+      bgColors.greenbg
+    )
+    expect(resolveNamedBackgroundColor("blue", lightTheme.emotion)).toBe(
+      bgColors.bluebg
+    )
+    expect(resolveNamedBackgroundColor("violet", lightTheme.emotion)).toBe(
+      bgColors.violetbg
+    )
+    expect(resolveNamedBackgroundColor("purple", lightTheme.emotion)).toBe(
+      bgColors.purplebg
+    )
+    expect(resolveNamedBackgroundColor("gray", lightTheme.emotion)).toBe(
+      bgColors.graybg
+    )
+    expect(resolveNamedBackgroundColor("grey", lightTheme.emotion)).toBe(
+      bgColors.graybg
+    )
+    expect(resolveNamedBackgroundColor("primary", lightTheme.emotion)).toBe(
+      bgColors.primarybg
+    )
+  })
+
+  it("resolves builtin color names to background colors for dark theme", () => {
+    const bgColors = getThemeBackgroundColors(darkTheme.emotion)
+
+    expect(resolveNamedBackgroundColor("red", darkTheme.emotion)).toBe(
+      bgColors.redbg
+    )
+    expect(resolveNamedBackgroundColor("blue", darkTheme.emotion)).toBe(
+      bgColors.bluebg
+    )
+    expect(resolveNamedBackgroundColor("primary", darkTheme.emotion)).toBe(
+      bgColors.primarybg
+    )
+  })
+
+  it("handles case-insensitive color names", () => {
+    const bgColors = getThemeBackgroundColors(lightTheme.emotion)
+
+    expect(resolveNamedBackgroundColor("RED", lightTheme.emotion)).toBe(
+      bgColors.redbg
+    )
+    expect(resolveNamedBackgroundColor("Blue", lightTheme.emotion)).toBe(
+      bgColors.bluebg
+    )
+    expect(resolveNamedBackgroundColor("PRIMARY", lightTheme.emotion)).toBe(
+      bgColors.primarybg
+    )
+  })
+
+  it("returns non-builtin colors unchanged", () => {
+    expect(resolveNamedBackgroundColor("#ff0000", lightTheme.emotion)).toBe(
+      "#ff0000"
+    )
+    expect(resolveNamedBackgroundColor("pink", lightTheme.emotion)).toBe(
+      "pink"
+    )
+    expect(
+      resolveNamedBackgroundColor("rgb(255, 0, 0)", lightTheme.emotion)
+    ).toBe("rgb(255, 0, 0)")
+  })
+
+  it("has distinct purple and violet background colors", () => {
+    const bgColors = getThemeBackgroundColors(lightTheme.emotion)
+
+    expect(resolveNamedBackgroundColor("purple", lightTheme.emotion)).toBe(
+      bgColors.purplebg
+    )
+    expect(resolveNamedBackgroundColor("violet", lightTheme.emotion)).toBe(
+      bgColors.violetbg
+    )
+    // Unlike main colors, purple and violet have distinct background colors
+    expect(bgColors.purplebg).not.toBe(bgColors.violetbg)
+  })
+})

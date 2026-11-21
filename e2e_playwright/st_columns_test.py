@@ -1,0 +1,495 @@
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import re
+
+from playwright.sync_api import Locator, Page, expect
+
+from e2e_playwright.conftest import ImageCompareFunction, wait_until
+from e2e_playwright.shared.app_utils import (
+    click_button,
+    expect_markdown,
+    expect_no_exception,
+    get_element_by_key,
+    get_expander,
+)
+
+
+def _get_basic_column_container(app: Page, index: int = 0) -> Locator:
+    column_container = app.get_by_test_id("stHorizontalBlock").nth(index)
+    expect(column_container).to_be_visible()
+    return column_container
+
+
+def _expect_equal_column_heights(app: Page, column_container: Locator) -> None:
+    """Columns stay as tall as their row; vertical alignment only moves content."""
+    columns = column_container.get_by_test_id("stColumn")
+
+    def _heights_are_equal() -> bool:
+        column_list = columns.all()
+        if len(column_list) < 2:
+            return False
+        heights = set()
+        for column in column_list:
+            box = column.bounding_box()
+            if box is None:
+                return False
+            heights.add(round(box["height"]))
+        return len(heights) == 1
+
+    wait_until(app, _heights_are_equal)
+
+
+def test_show_columns_horizontally_when_viewport_allows(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Shows columns horizontally when viewport > 640."""
+    app.set_viewport_size({"width": 641, "height": 800})
+    column_container = _get_basic_column_container(app)
+    expect(column_container.get_by_test_id("stMarkdownContainer").last).to_be_visible()
+    assert_snapshot(column_container, name="st_columns-responsive_layout_horizontal")
+
+
+def test_show_columns_vertically_when_viewport_requires(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Stacks columns vertically when viewport <= 640."""
+    app.set_viewport_size({"width": 640, "height": 800})
+    column_container = _get_basic_column_container(app)
+    expect(column_container.get_by_test_id("stMarkdownContainer").last).to_be_visible()
+    assert_snapshot(column_container, name="st_columns-responsive_layout_vertical")
+
+
+def test_columns_always_take_up_space(app: Page, assert_snapshot: ImageCompareFunction):
+    """Test that columns still takes up space with no elements present."""
+    column_container = _get_basic_column_container(app, 1)
+    expect(column_container.get_by_test_id("stMarkdownContainer").last).to_be_visible()
+    assert_snapshot(column_container, name="st_columns-with_empty_columns")
+
+
+def test_columns_with_border(app: Page, assert_snapshot: ImageCompareFunction):
+    """Test that columns with border are correctly displayed."""
+    column_container = _get_basic_column_container(app, 2)
+    expect(column_container.get_by_test_id("stSlider").last).to_be_visible()
+    assert_snapshot(column_container, name="st_columns-with_border")
+
+
+def test_column_gap_is_correctly_applied(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Test that the different-sized column gaps are correctly applied."""
+
+    gaps = [
+        (None, "0"),
+        ("xxsmall", "4px"),
+        ("xsmall", "8px"),
+        ("small", "16px"),
+        ("medium", "32px"),
+        ("large", "64px"),
+        ("xlarge", "96px"),
+        ("xxlarge", "128px"),
+    ]
+
+    for gap, gap_value in gaps:
+        gap_name = str(gap).lower()
+
+        column_gap = (
+            get_expander(app, f"Column gap {gap_name}")
+            .get_by_test_id("stHorizontalBlock")
+            .nth(0)
+        )
+        # We use regex here since some browsers may resolve this to two numbers:
+        expect(column_gap).to_have_css("gap", re.compile(gap_value))
+        column_gap.scroll_into_view_if_needed()
+        assert_snapshot(column_gap, name=f"st_columns-column_gap_{gap_name}")
+
+
+def test_one_level_nesting_works_correctly(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Test that its possible to nest columns for one level."""
+    nested_columns = (
+        get_expander(app, "Nested columns - one level")
+        .get_by_test_id("stHorizontalBlock")
+        .nth(0)
+    )
+    expect(nested_columns.get_by_test_id("stMarkdownContainer").last).to_be_visible()
+    assert_snapshot(nested_columns, name="st_columns-nested_one_level")
+
+
+def test_column_variable_relative_width(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Test that a variable relative width works correctly."""
+    column = (
+        get_expander(app, "Variable-width columns (relative numbers)")
+        .get_by_test_id("stHorizontalBlock")
+        .nth(0)
+    )
+    expect(column.get_by_test_id("stImageContainer").last).to_be_visible()
+    assert_snapshot(column, name="st_columns-variable_width_relative")
+
+
+def test_column_variable_absolute_width(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Test that a variable absolute width works correctly."""
+    column = (
+        get_expander(app, "Variable-width columns (absolute numbers)")
+        .get_by_test_id("stHorizontalBlock")
+        .nth(0)
+    )
+    expect(column.get_by_test_id("stImageContainer").last).to_be_visible()
+    assert_snapshot(column, name="st_columns-variable_width_absolute")
+
+
+def test_column_vertical_alignment_top(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Test that vertical alignment top works correctly."""
+    column = (
+        get_expander(app, "Vertical alignment - top")
+        .get_by_test_id("stHorizontalBlock")
+        .nth(0)
+    )
+
+    expect(column.get_by_test_id("stCheckbox").first).to_be_visible()
+    expect(column.get_by_test_id("stButton").last).to_be_visible()
+    expect(column.get_by_test_id("stTextInput").first).to_be_visible()
+
+    # Should apply a top margin to the first checkbox for
+    # simpler visual alignment with other elements.
+    expect(column.get_by_test_id("stCheckbox").first).to_have_css("margin-top", "8px")
+
+    assert_snapshot(
+        column,
+        name="st_columns-vertical_alignment_top",
+    )
+
+
+def test_column_top_alignment_does_not_leak_into_nested_horizontal_container(
+    app: Page,
+):
+    """Regression test for #13162.
+
+    Checkboxes inside a horizontal container nested inside a TOP-aligned
+    column must not receive the alignment `margin-top`. The margin should
+    only apply to direct-child first checkboxes of the column.
+    """
+    column_container = (
+        get_expander(app, "Nested horizontal container in top-aligned column")
+        .get_by_test_id("stHorizontalBlock")
+        .nth(0)
+    )
+
+    checkboxes = column_container.get_by_test_id("stCheckbox")
+    expect(checkboxes).to_have_count(3)
+
+    # None of the checkboxes in the nested horizontal container should have
+    # the alignment margin — previously the first-of-type inside the nested
+    # container was incorrectly picking it up.
+    for i in range(3):
+        expect(checkboxes.nth(i)).to_have_css("margin-top", "0px")
+
+
+def test_column_vertical_alignment_center(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Test that vertical alignment center works correctly."""
+    column = (
+        get_expander(app, "Vertical alignment - center")
+        .get_by_test_id("stHorizontalBlock")
+        .nth(0)
+    )
+
+    expect(column.get_by_test_id("stCheckbox").first).to_be_visible()
+    expect(column.get_by_test_id("stButton").last).to_be_visible()
+    expect(column.get_by_test_id("stTextInput").first).to_be_visible()
+    _expect_equal_column_heights(app, column)
+
+    assert_snapshot(
+        column,
+        name="st_columns-vertical_alignment_center",
+    )
+
+
+def test_column_vertical_alignment_bottom(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Test that vertical alignment bottom works correctly."""
+    column = (
+        get_expander(app, "Vertical alignment - bottom")
+        .get_by_test_id("stHorizontalBlock")
+        .nth(0)
+    )
+
+    expect(column.get_by_test_id("stCheckbox").first).to_be_visible()
+    expect(column.get_by_test_id("stButton").last).to_be_visible()
+    expect(column.get_by_test_id("stTextInput").first).to_be_visible()
+
+    # Should apply a bottom margin to the last checkbox for
+    # simpler visual alignment with other elements.
+    expect(column.get_by_test_id("stCheckbox").last).to_have_css("margin-bottom", "8px")
+    _expect_equal_column_heights(app, column)
+    assert_snapshot(
+        column,
+        name="st_columns-vertical_alignment_bottom",
+    )
+
+
+def test_column_vertical_alignment_applies_to_toggles(app: Page):
+    """Protect the toggle side of the column-alignment CSS.
+
+    `test_column_vertical_alignment_top` and `test_column_vertical_alignment_bottom`
+    assert only on checkboxes, so neither would catch toggles losing the margin.
+    """
+    top_row = get_element_by_key(app, "vertical_alignment_toggle_top")
+    top_toggles = top_row.get_by_test_id("stCheckbox")
+    expect(top_toggles).to_have_count(2)
+    expect(top_toggles.first).to_have_css("margin-top", "8px")
+    # The top rule must not also apply a bottom margin.
+    expect(top_toggles.last).to_have_css("margin-bottom", "0px")
+
+    bottom_row = get_element_by_key(app, "vertical_alignment_toggle_bottom")
+    bottom_toggles = bottom_row.get_by_test_id("stCheckbox")
+    expect(bottom_toggles).to_have_count(2)
+    expect(bottom_toggles.last).to_have_css("margin-bottom", "8px")
+    # The bottom rule must not also apply a top margin.
+    expect(bottom_toggles.first).to_have_css("margin-top", "0px")
+
+
+def test_bordered_bottom_aligned_columns_keep_equal_height(app: Page):
+    """Bordered columns match the row height; only their content moves down."""
+    column_group = get_element_by_key(app, "columns_bordered_bottom").get_by_test_id(
+        "stHorizontalBlock"
+    )
+    _expect_equal_column_heights(app, column_group)
+
+    columns = column_group.get_by_test_id("stColumn")
+    tall_last_line = columns.nth(0).get_by_test_id("stMarkdown").last
+    short_content = columns.nth(1).get_by_test_id("stMarkdown")
+    expect(short_content).to_be_visible()
+
+    # The short column's content is aligned with the bottom of the tall column.
+    def _short_content_is_bottom_aligned() -> bool:
+        tall_box = tall_last_line.bounding_box()
+        short_box = short_content.bounding_box()
+        if tall_box is None or short_box is None:
+            return False
+        tall_bottom = tall_box["y"] + tall_box["height"]
+        short_bottom = short_box["y"] + short_box["height"]
+        return abs(tall_bottom - short_bottom) < 2
+
+    wait_until(app, _short_content_is_bottom_aligned)
+
+
+def test_nesting_columns_is_allowed(app: Page):
+    """Checks that nesting columns is allowed."""
+
+    click_button(app, "Nested columns - two levels")
+    expect_no_exception(app)
+
+    click_button(app, "Nested columns - in sidebar")
+    expect_no_exception(app)
+
+
+def test_width_is_correctly_applied(app: Page, assert_snapshot: ImageCompareFunction):
+    """Test that st.columns dimensions are correctly applied."""
+    column_fixed_width_container = (
+        get_expander(app, "Columns with width configuration")
+        .get_by_test_id("stHorizontalBlock")
+        .nth(0)
+    )
+
+    expect_markdown(
+        app,
+        "column three",
+    )
+    assert_snapshot(
+        column_fixed_width_container, name="st_columns-width_configuration_fixed"
+    )
+
+    column_stretch_width_container = (
+        get_expander(app, "Columns with width configuration")
+        .get_by_test_id("stHorizontalBlock")
+        .nth(1)
+    )
+    expect(
+        column_stretch_width_container.get_by_test_id("stMarkdownContainer").last
+    ).to_be_visible()
+    assert_snapshot(
+        column_stretch_width_container, name="st_columns-width_configuration_stretch"
+    )
+
+
+def test_columns_wrap_false_keeps_single_row_and_scrolls(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """wrap=False keeps columns in one row and scrolls locally at narrow widths."""
+    app.set_viewport_size({"width": 640, "height": 800})
+
+    container = get_element_by_key(app, "columns_wrap_false")
+    column_group = container.get_by_test_id("stHorizontalBlock")
+    expect(column_group).to_be_visible()
+    expect(column_group).to_have_attribute("data-test-wrap", "false")
+
+    columns = column_group.get_by_test_id("stColumn")
+    expect(columns).to_have_count(6)
+
+    # All columns stay on one row (aligned tops) instead of stacking.
+    # wait_until guards against layout races right after viewport resize.
+    def _columns_share_row() -> bool:
+        first_box = columns.nth(0).bounding_box()
+        last_box = columns.nth(5).bounding_box()
+        if first_box is None or last_box is None:
+            return False
+        return abs(first_box["y"] - last_box["y"]) < 2
+
+    wait_until(app, _columns_share_row)
+
+    # Overflow is contained by the column group, not the page.
+    def _has_horizontal_overflow() -> bool:
+        return bool(column_group.evaluate("el => el.scrollWidth > el.clientWidth + 1"))
+
+    wait_until(app, _has_horizontal_overflow)
+
+    # Overflow stays on the column group; the page itself should not scroll.
+    def _page_fits_without_scroll() -> bool:
+        return bool(
+            app.evaluate(
+                "() => document.documentElement.scrollWidth <= "
+                "document.documentElement.clientWidth + 1"
+            )
+        )
+
+    wait_until(app, _page_fits_without_scroll)
+
+    column_group.scroll_into_view_if_needed()
+    assert_snapshot(column_group, name="st_columns-wrap_false_narrow")
+
+
+def test_columns_wrap_false_relative_widths_at_desktop(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """wrap=False preserves relative widths above the stacking breakpoint."""
+    app.set_viewport_size({"width": 1000, "height": 800})
+
+    container = get_element_by_key(app, "columns_wrap_false_relative")
+    column_group = container.get_by_test_id("stHorizontalBlock")
+    columns = column_group.get_by_test_id("stColumn")
+    expect(columns).to_have_count(3)
+    expect(column_group.get_by_test_id("stMarkdownContainer").last).to_be_visible()
+
+    # Relative [3, 1, 2] weights: wide > medium > narrow.
+    def _relative_widths_preserved() -> bool:
+        wide_box = columns.nth(0).bounding_box()
+        narrow_box = columns.nth(1).bounding_box()
+        medium_box = columns.nth(2).bounding_box()
+        if wide_box is None or narrow_box is None or medium_box is None:
+            return False
+        return wide_box["width"] > medium_box["width"] > narrow_box["width"]
+
+    wait_until(app, _relative_widths_preserved)
+
+    # At desktop width, wrap=False should not introduce unnecessary overflow.
+    def _no_horizontal_overflow() -> bool:
+        return bool(column_group.evaluate("el => el.scrollWidth <= el.clientWidth + 1"))
+
+    wait_until(app, _no_horizontal_overflow)
+
+    assert_snapshot(column_group, name="st_columns-wrap_false_relative_widths")
+
+
+def test_columns_wrap_true_still_stacks_at_narrow_viewport(app: Page):
+    """Explicit wrap=True keeps today's stacking behavior at 640px."""
+    app.set_viewport_size({"width": 640, "height": 800})
+
+    container = get_element_by_key(app, "columns_wrap_true")
+    column_group = container.get_by_test_id("stHorizontalBlock")
+    columns = column_group.get_by_test_id("stColumn")
+    expect(columns).to_have_count(3)
+
+    # wait_until guards against layout races right after viewport resize.
+    wait_until(app, lambda: _columns_are_stacked(columns))
+
+
+def _columns_are_stacked(columns: Locator) -> bool:
+    first_box = columns.nth(0).bounding_box()
+    second_box = columns.nth(1).bounding_box()
+    if first_box is None or second_box is None:
+        return False
+    return second_box["y"] > first_box["y"] + first_box["height"] / 2
+
+
+def _has_divider(column: Locator) -> bool:
+    """Whether the column draws a divider line before it.
+
+    A column without the pseudo-element reports `content: none`, and a
+    stacked column hides it with `display: none`.
+    """
+    return bool(
+        column.evaluate(
+            """el => {
+                const style = getComputedStyle(el, '::before');
+                return (
+                    style.content !== 'none' &&
+                    style.content !== 'normal' &&
+                    style.display !== 'none'
+                );
+            }"""
+        )
+    )
+
+
+def test_columns_with_divider(themed_app: Page, assert_snapshot: ImageCompareFunction):
+    """Vertical lines sit between neighboring columns, never before the first."""
+    container = get_element_by_key(themed_app, "columns_divider")
+    column_group = container.get_by_test_id("stHorizontalBlock")
+    columns = column_group.get_by_test_id("stColumn")
+    expect(columns).to_have_count(3)
+    expect(columns.nth(1)).to_be_visible()
+    assert not _has_divider(columns.nth(0))
+    assert _has_divider(columns.nth(1))
+    assert_snapshot(column_group, name="st_columns-with_divider")
+
+
+def test_columns_divider_with_no_gap(app: Page, assert_snapshot: ImageCompareFunction):
+    """With gap=None, the divider still appears on the shared edge."""
+    container = get_element_by_key(app, "columns_divider_gap_none")
+    column_group = container.get_by_test_id("stHorizontalBlock")
+    expect(column_group.get_by_test_id("stColumn")).to_have_count(3)
+    assert_snapshot(column_group, name="st_columns-with_divider_gap_none")
+
+
+def test_columns_divider_with_border(app: Page, assert_snapshot: ImageCompareFunction):
+    """Border and divider can be enabled together."""
+    container = get_element_by_key(app, "columns_divider_and_border")
+    column_group = container.get_by_test_id("stHorizontalBlock")
+    columns = column_group.get_by_test_id("stColumn")
+    expect(columns).to_have_count(2)
+    assert _has_divider(columns.nth(1))
+    assert_snapshot(column_group, name="st_columns-with_divider_and_border")
+
+
+def test_columns_divider_hides_when_stacked(app: Page):
+    """Stacked columns do not keep leftover vertical divider lines."""
+    app.set_viewport_size({"width": 640, "height": 800})
+
+    container = get_element_by_key(app, "columns_divider_wrap")
+    column_group = container.get_by_test_id("stHorizontalBlock")
+    columns = column_group.get_by_test_id("stColumn")
+    expect(columns).to_have_count(3)
+
+    wait_until(app, lambda: _columns_are_stacked(columns))
+    assert not _has_divider(columns.nth(1))

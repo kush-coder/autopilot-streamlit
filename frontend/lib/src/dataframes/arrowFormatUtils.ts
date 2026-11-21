@@ -1,0 +1,1070 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * Utility functions to format cell data from an arrow table to
+ * a human-readable format.
+ */
+
+import { type Field, Struct, type StructRow, TimeUnit } from "apache-arrow"
+import { trimEnd } from "lodash-es"
+import { getLogger } from "loglevel"
+import moment from "moment-timezone"
+import numbro from "numbro"
+
+import { isNullOrUndefined, notNullOrUndefined } from "~lib/util/utils"
+
+import {
+  type ArrowType,
+  DataFrameCellType,
+  type DataType,
+  getFormattableCategoryType,
+  isDatetimeType,
+  isDateType,
+  isDecimalType,
+  isDurationType,
+  isFloatType,
+  isIntervalType,
+  isListType,
+  isObjectType,
+  isPeriodType,
+  isStringType,
+  isTimeType,
+} from "./arrowTypeUtils"
+
+/**
+ * The frequency strings defined in pandas.
+ * See: https://pandas.pydata.org/docs/user_guide/timeseries.html#period-aliases
+ * Not supported: "N" (nanoseconds), "U" & "us" (microseconds), and "B" (business days).
+ * Reason is that these types are not supported by moment.js, but also they are not
+ * very commonly used in practice.
+ */
+type SupportedPandasOffsetType =
+  // yearly frequency:
+  | "A" // deprecated alias
+  | "Y"
+  // quarterly frequency:
+  | "Q"
+  // monthly frequency:
+  | "M"
+  // weekly frequency:
+  | "W"
+  // calendar day frequency:
+  | "D"
+  // hourly frequency:
+  | "H" // deprecated alias
+  | "h"
+  // minutely frequency
+  | "T" // deprecated alias
+  | "min"
+  // secondly frequency:
+  | "S" // deprecated alias
+  | "s"
+  // milliseconds frequency:
+  | "L" // deprecated alias
+  | "ms"
+
+type PandasPeriodFrequency =
+  | SupportedPandasOffsetType
+  | `${SupportedPandasOffsetType}-${string}`
+
+const LOG = getLogger("arrowFormatUtils")
+const WEEKDAY_SHORT = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+
+/**
+ * Arrow `Field.type` is `any` on untyped tables, and some tests pass a
+ * `{ unit }` stub without a `typeId`. Read the property as `unknown` so
+ * both real Arrow instances (including a duplicate apache-arrow copy)
+ * and duck-typed fixtures stay `no-unsafe-argument` clean.
+ */
+export function getArrowTimeUnit(
+  field: Field | undefined,
+  fallback: TimeUnit
+): TimeUnit {
+  const dataType = field?.type as { unit?: unknown } | undefined
+  const unit: unknown = dataType?.unit
+  return typeof unit === "number" ? unit : fallback
+}
+
+function getArrowTimezone(field: Field | undefined): string | undefined {
+  const dataType = field?.type as { timezone?: unknown } | undefined
+  const timezone: unknown = dataType?.timezone
+  return typeof timezone === "string" && timezone ? timezone : undefined
+}
+
+function getArrowScale(field: Field | undefined): number {
+  const dataType = field?.type as { scale?: unknown } | undefined
+  const scale: unknown = dataType?.scale
+  return typeof scale === "number" ? scale : 0
+}
+
+const formatMs = (duration: number): string =>
+  moment("19700101", "YYYYMMDD")
+    .add(duration, "ms")
+    .format("YYYY-MM-DD HH:mm:ss.SSS")
+
+const formatSec = (duration: number): string =>
+  moment("19700101", "YYYYMMDD")
+    .add(duration, "s")
+    .format("YYYY-MM-DD HH:mm:ss")
+
+const formatMin = (duration: number): string =>
+  moment("19700101", "YYYYMMDD").add(duration, "m").format("YYYY-MM-DD HH:mm")
+
+const formatHours = (duration: number): string =>
+  moment("19700101", "YYYYMMDD").add(duration, "h").format("YYYY-MM-DD HH:mm")
+
+const formatDay = (duration: number): string =>
+  moment("19700101", "YYYYMMDD").add(duration, "d").format("YYYY-MM-DD")
+
+const formatMonth = (duration: number): string =>
+  moment("19700101", "YYYYMMDD").add(duration, "M").format("YYYY-MM")
+
+const formatYear = (duration: number): string =>
+  moment("19700101", "YYYYMMDD").add(duration, "y").format("YYYY")
+
+const formatWeeks = (duration: number, freqParam?: string): string => {
+  if (!freqParam) {
+    throw new Error('Frequency "W" requires parameter')
+  }
+  const dayIndex = WEEKDAY_SHORT.indexOf(freqParam)
+  if (dayIndex < 0) {
+    throw new Error(
+      `Invalid value: ${freqParam}. Supported values: ${JSON.stringify(
+        WEEKDAY_SHORT
+      )}`
+    )
+  }
+  const startDate = moment("19700101", "YYYYMMDD")
+    .add(duration, "w")
+    .day(dayIndex - 6)
+    .format("YYYY-MM-DD")
+  const endDate = moment("19700101", "YYYYMMDD")
+    .add(duration, "w")
+    .day(dayIndex)
+    .format("YYYY-MM-DD")
+
+  return `${startDate}/${endDate}`
+}
+
+const formatQuarter = (duration: number): string =>
+  moment("19700101", "YYYYMMDD")
+    .add(duration, "Q")
+    .endOf("quarter")
+    .format("YYYY[Q]Q")
+
+type PeriodFormatter = (duration: number, freqParam?: string) => string
+
+/**
+ * Formatters for the different pandas period frequencies.
+ *
+ * This is a mapping from the frequency strings to the function that formats the period.
+ */
+const PERIOD_TYPE_FORMATTERS: Record<
+  SupportedPandasOffsetType,
+  PeriodFormatter
+> = {
+  L: formatMs,
+  ms: formatMs,
+  S: formatSec,
+  s: formatSec,
+  T: formatMin,
+  min: formatMin,
+  H: formatHours,
+  h: formatHours,
+  D: formatDay,
+  M: formatMonth,
+  W: formatWeeks,
+  Q: formatQuarter,
+  Y: formatYear,
+  A: formatYear,
+}
+
+/** Pandas interval extension data type. */
+interface PandasInterval {
+  left: number
+  right: number
+}
+
+/**
+ * JSON stored on Arrow's `pandas.interval` extension metadata.
+ * See pandas `ArrowIntervalType.__arrow_ext_serialize__`.
+ */
+interface PandasIntervalExtensionMetadata {
+  subtype: string
+  closed: string
+}
+
+/**
+ * Parses pandas interval extension metadata.
+ * Invalid JSON throws so `format()` can log it and render the raw cell.
+ * Returns undefined when `subtype` or `closed` is missing or not a string.
+ */
+function parsePandasIntervalExtensionMetadata(
+  rawMetadata: string
+): PandasIntervalExtensionMetadata | undefined {
+  const parsed: unknown = JSON.parse(rawMetadata)
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    !("subtype" in parsed) ||
+    !("closed" in parsed)
+  ) {
+    return undefined
+  }
+
+  const { subtype, closed } = parsed
+  if (typeof subtype !== "string" || typeof closed !== "string") {
+    return undefined
+  }
+
+  return { subtype, closed }
+}
+
+/**
+ * Adjusts a time value to seconds based on the unit information in the field.
+ *
+ * The unit numbers are specified here:
+ * https://github.com/apache/arrow/blob/3ab246f374c17a216d86edcfff7ff416b3cff803/js/src/enum.ts#L95
+ *
+ * @param timestamp The timestamp to convert.
+ * @param unit The unit of the timestamp. 0 is seconds, 1 is milliseconds, 2 is microseconds, 3 is nanoseconds.
+ * @returns The timestamp in seconds.
+ */
+export function convertTimestampToSeconds(
+  timestamp: number | bigint,
+  unit: TimeUnit
+): number {
+  let unitAdjustment
+
+  if (unit === TimeUnit.MILLISECOND) {
+    // Milliseconds
+    unitAdjustment = 1000
+  } else if (unit === TimeUnit.MICROSECOND) {
+    // Microseconds
+    unitAdjustment = 1000 * 1000
+  } else if (unit === TimeUnit.NANOSECOND) {
+    // Nanoseconds
+    unitAdjustment = 1000 * 1000 * 1000
+  } else {
+    // Interpret it as seconds as a fallback
+    return Number(timestamp)
+  }
+
+  return divideTicks(timestamp, unitAdjustment)
+}
+
+/**
+ * Divides an Arrow tick count by the number of ticks per target unit.
+ *
+ * Bigints outside JavaScript's safe integer range are divided as bigints, and
+ * the integer quotient is recombined with the remainder, so the fractional
+ * part is kept after the ticks overflow that range.
+ */
+function divideTicks(ticks: number | bigint, ticksPerUnit: number): number {
+  if (typeof ticks === "bigint" && !Number.isSafeInteger(Number(ticks))) {
+    const ticksPerUnitBigInt = BigInt(ticksPerUnit)
+    const wholeUnits = ticks / ticksPerUnitBigInt
+    const remainder = ticks % ticksPerUnitBigInt
+    return Number(wholeUnits) + Number(remainder) / ticksPerUnit
+  }
+
+  return Number(ticks) / ticksPerUnit
+}
+
+/**
+ * Converts a UTC time value (timestamp) to a date object.
+ *
+ * @param timestamp The timestamp to convert.
+ * @param field The field containing the unit information.
+ * @returns The date object in UTC timezone.
+ */
+export function convertTimeToDate(
+  timestamp: number | bigint,
+  field?: Field
+): Date {
+  // Time values from arrow are not converted to a shared unit and
+  // just return the raw arrow value. Therefore, we need to adjust
+  // the value to seconds based on the unit information in the field.
+  // https://github.com/apache/arrow/blob/9e08c57c0986531879aadf7942998d26a94a5d1b/js/src/visitor/get.ts#L193C7-L209
+  const timeInSeconds = convertTimestampToSeconds(
+    timestamp,
+    // The default is SECOND because that is the default unit for time values in pandas.
+    // Though we believe that actually always a unit is populated by arrow.
+    getArrowTimeUnit(field, TimeUnit.SECOND)
+  )
+  return moment.unix(timeInSeconds).utc().toDate()
+}
+
+/**
+ * Converts a duration (timedelta) value to milliseconds based on the unit
+ * information in the field.
+ *
+ * Nanosecond and microsecond counts are divided straight into milliseconds,
+ * avoiding the float noise of going through seconds (`20.987638999999998`).
+ * Bigints outside the safe integer range keep their sub-millisecond remainder.
+ *
+ * @param duration The duration value in the field's unit.
+ * @param field The field containing the unit information. Without one, the
+ * value is read as nanoseconds (the pandas default).
+ * @returns The duration in milliseconds.
+ */
+export function convertDurationToMilliseconds(
+  duration: number | bigint,
+  field?: Field
+): number {
+  const unit = getArrowTimeUnit(field, TimeUnit.NANOSECOND)
+
+  if (unit === TimeUnit.NANOSECOND) {
+    return divideTicks(duration, 1_000_000)
+  }
+  if (unit === TimeUnit.MICROSECOND) {
+    return divideTicks(duration, 1_000)
+  }
+  if (unit === TimeUnit.MILLISECOND) {
+    return Number(duration)
+  }
+  // Interpret it as seconds as a fallback.
+  return Number(duration) * 1000
+}
+
+/**
+ * Formats a time value based on the unit information in the field.
+ *
+ * @param timestamp The time value to format.
+ * @param field The field containing the unit information.
+ * @returns The formatted time value.
+ */
+function formatTime(timestamp: number | bigint, field?: Field): string {
+  const date = convertTimeToDate(timestamp, field)
+  return moment(date)
+    .utc()
+    .format(date.getMilliseconds() === 0 ? "HH:mm:ss" : "HH:mm:ss.SSS")
+}
+
+function formatDate(date: number | Date): string {
+  // Date values from arrow are already converted to a date object
+  // or a timestamp in milliseconds even if the field unit belonging to the
+  // passed date might have indicated a different unit.
+  // That's why we don't need the field information here (aka its not passed to the function)
+  // and we don't need to apply any unit conversion.
+  // https://github.com/apache/arrow/blob/9e08c57c0986531879aadf7942998d26a94a5d1b/js/src/visitor/get.ts#L167-L171
+
+  const formatPattern = "YYYY-MM-DD"
+
+  if (
+    !(
+      date instanceof Date ||
+      (typeof date === "number" && Number.isFinite(date))
+    )
+  ) {
+    LOG.warn(`Unsupported date value: ${date}`)
+    return String(date)
+  }
+
+  return moment.utc(date).format(formatPattern)
+}
+
+/**
+ * Format datetime value from Arrow to string.
+ */
+function formatDatetime(date: number | Date, field?: Field): string {
+  // Datetime values from arrow are already converted to a date object
+  // or a timestamp in milliseconds even if the field unit might indicate a
+  // different unit.
+  // https://github.com/apache/arrow/blob/9e08c57c0986531879aadf7942998d26a94a5d1b/js/src/visitor/get.ts#L174-L190
+
+  if (
+    !(
+      date instanceof Date ||
+      (typeof date === "number" && Number.isFinite(date))
+    )
+  ) {
+    LOG.warn(`Unsupported datetime value: ${date}`)
+    return String(date)
+  }
+
+  let datetime = moment.utc(date)
+
+  const timezone = getArrowTimezone(field)
+  if (timezone) {
+    if (moment.tz.zone(timezone)) {
+      // If timezone is a valid timezone name (e.g., "America/New_York")
+      datetime = datetime.tz(timezone)
+    } else {
+      // If timezone is a UTC offset (e.g., "+0500")
+      datetime = datetime.utcOffset(timezone)
+    }
+
+    return datetime.format("YYYY-MM-DD HH:mm:ssZ")
+  }
+  // Return the timestamp without timezone information
+  return datetime.format("YYYY-MM-DD HH:mm:ss")
+}
+
+// Pandas Timedelta is stored as int64 nanoseconds (~±292 years).
+const PANDAS_TIMEDELTA_MAX_SECONDS = 2 ** 63 / 1e9
+
+// Below this many ticks, scaling a second count to ticks is off by less than
+// one tick, so the exact tick can be recovered.
+const EXACT_DURATION_TICK_LIMIT = 2 ** 52
+
+/**
+ * Number of decimal second places represented by a duration field's unit.
+ * Without a unit, the field is read as nanoseconds (the pandas default).
+ */
+export function getDurationFractionalSecondDigits(field?: Field): number {
+  switch (getArrowTimeUnit(field, TimeUnit.NANOSECOND)) {
+    case TimeUnit.SECOND:
+      return 0
+    case TimeUnit.MILLISECOND:
+      return 3
+    case TimeUnit.MICROSECOND:
+      return 6
+    case TimeUnit.NANOSECOND:
+    default:
+      return 9
+  }
+}
+
+/**
+ * True when a second count fits a pandas Timedelta and the duration unit
+ * (given as its number of fractional second digits) can represent it.
+ */
+export function isValidDurationSeconds(
+  seconds: number,
+  fractionalSecondDigits: number
+): boolean {
+  if (Math.abs(seconds) >= PANDAS_TIMEDELTA_MAX_SECONDS) {
+    return false
+  }
+
+  const scale = 10 ** fractionalSecondDigits
+  const scaledSeconds = seconds * scale
+  if (!Number.isFinite(scaledSeconds)) {
+    return false
+  }
+  const nearestTick = Math.round(scaledSeconds)
+  if (Math.abs(nearestTick) < EXACT_DURATION_TICK_LIMIT) {
+    // Ticks in this range are exact floats, so a representable second count
+    // is the float nearest to a whole tick. Scaling can land one tick off,
+    // so the neighboring ticks are checked as well.
+    return [nearestTick - 1, nearestTick, nearestTick + 1].some(
+      tick => tick / scale === seconds
+    )
+  }
+  // Past 2^52 ticks (for example, nanosecond durations past about 52 days),
+  // a float second count cannot hold every tick. Converting ticks to float
+  // seconds and back adds up to about one ulp of error, so allow two ulps of
+  // slack. A larger remainder means the value is finer than the column's unit.
+  const tickRemainder = Math.abs(scaledSeconds - nearestTick)
+  return tickRemainder <= Math.abs(scaledSeconds) * Number.EPSILON * 2
+}
+
+/** Calendar units passed to `Intl.DurationFormat`. */
+type DurationParts = {
+  days?: number
+  hours?: number
+  minutes?: number
+  seconds?: number
+  milliseconds?: number
+  microseconds?: number
+  nanoseconds?: number
+}
+
+type DurationFormatter = { format: (duration: DurationParts) => string }
+
+/** Constructor for `Intl.DurationFormat` when the runtime supports it. */
+type DurationFormatCtor = new (
+  locales?: string | readonly string[],
+  options?: {
+    style?: "long" | "short" | "narrow" | "digital"
+    secondsDisplay?: "always" | "auto"
+  }
+) => DurationFormatter
+
+/** Return `Intl.DurationFormat` when the runtime provides it. */
+function getDurationFormatCtor(): DurationFormatCtor | undefined {
+  return (Intl as typeof Intl & { DurationFormat?: DurationFormatCtor })
+    .DurationFormat
+}
+
+type SplitDurationSeconds = {
+  wholeSeconds: number
+  fractionalTicks: number
+  fractionalSecondDigits: number
+}
+
+/** Split non-negative seconds at the requested sub-second precision. */
+function splitDurationSeconds(
+  absSeconds: number,
+  fractionalSecondDigits: number
+): SplitDurationSeconds {
+  const safeFractionalSecondDigits = Math.min(
+    9,
+    Math.max(0, Math.trunc(fractionalSecondDigits))
+  )
+  const fractionalScale = 10 ** safeFractionalSecondDigits
+  let wholeSeconds = Math.floor(absSeconds)
+  let fractionalTicks =
+    safeFractionalSecondDigits === 0
+      ? 0
+      : Math.round((absSeconds - wholeSeconds) * fractionalScale)
+
+  // Floating-point conversion can round a value up to the next whole second.
+  if (fractionalTicks === fractionalScale) {
+    wholeSeconds += 1
+    fractionalTicks = 0
+  }
+
+  return {
+    wholeSeconds,
+    fractionalTicks,
+    fractionalSecondDigits: safeFractionalSecondDigits,
+  }
+}
+
+/** Split a non-negative second count into localized duration parts. */
+function toDurationParts(
+  absSeconds: number,
+  fractionalSecondDigits: number
+): DurationParts {
+  const { wholeSeconds, fractionalTicks } = splitDurationSeconds(
+    absSeconds,
+    fractionalSecondDigits
+  )
+  const days = Math.floor(wholeSeconds / 86400)
+  const hours = Math.floor((wholeSeconds % 86400) / 3600)
+  const minutes = Math.floor((wholeSeconds % 3600) / 60)
+  const seconds = wholeSeconds % 60
+  const parts: DurationParts = {}
+  if (days) {
+    parts.days = days
+  }
+  if (hours) {
+    parts.hours = hours
+  }
+  if (minutes) {
+    parts.minutes = minutes
+  }
+  if (seconds) {
+    parts.seconds = seconds
+  }
+
+  if (fractionalTicks) {
+    // Scale the column unit's fractional ticks up to nanoseconds for
+    // Intl.DurationFormat.
+    const fractionalNanoseconds =
+      fractionalTicks * 10 ** (9 - fractionalSecondDigits)
+    const milliseconds = Math.floor(fractionalNanoseconds / 1_000_000)
+    const microseconds = Math.floor(
+      (fractionalNanoseconds % 1_000_000) / 1_000
+    )
+    const nanoseconds = fractionalNanoseconds % 1_000
+    if (milliseconds) {
+      parts.milliseconds = milliseconds
+    }
+    if (microseconds) {
+      parts.microseconds = microseconds
+    }
+    if (nanoseconds) {
+      parts.nanoseconds = nanoseconds
+    }
+  }
+
+  // Ensure a zero duration has a part for Intl.DurationFormat to render.
+  if (Object.keys(parts).length === 0) {
+    parts.seconds = 0
+  }
+  return parts
+}
+
+const durationFormatters = new Map<string, DurationFormatter>()
+
+/**
+ * Cached `Intl.DurationFormat` instance for the given locale list.
+ *
+ * `showZeroSeconds` keeps a zero seconds part visible. Use it only for an
+ * all-zero duration: it would also append "0 sec" to other durations.
+ */
+function getDurationFormatter(
+  durationFormatCtor: DurationFormatCtor,
+  locales: string | readonly string[] | undefined,
+  showZeroSeconds: boolean
+): DurationFormatter {
+  const localesKey = isNullOrUndefined(locales) ? "" : String(locales)
+  const cacheKey = `${localesKey}|${showZeroSeconds}`
+  const cached = durationFormatters.get(cacheKey)
+  if (cached) {
+    return cached
+  }
+
+  const formatter = new durationFormatCtor(
+    locales,
+    showZeroSeconds
+      ? { style: "short", secondsDisplay: "always" }
+      : { style: "short" }
+  )
+  durationFormatters.set(cacheKey, formatter)
+  return formatter
+}
+
+/** Format duration parts with a cached `Intl.DurationFormat`. */
+function formatDurationParts(
+  durationFormatCtor: DurationFormatCtor,
+  locales: string | readonly string[] | undefined,
+  parts: DurationParts
+): string {
+  // Intl.DurationFormat hides zero-valued units by default, so an all-zero
+  // duration would be an empty string.
+  const isZeroDuration = Object.values(parts).every(value => value === 0)
+  return getDurationFormatter(
+    durationFormatCtor,
+    locales,
+    isZeroDuration
+  ).format(parts)
+}
+
+/** Exact locale-aware duration, or undefined if `Intl.DurationFormat` is missing. */
+function formatDurationWithIntl(
+  absSeconds: number,
+  fractionalSecondDigits: number
+): string | undefined {
+  const durationFormatCtor = getDurationFormatCtor()
+  if (!durationFormatCtor) {
+    return undefined
+  }
+
+  const parts = toDurationParts(absSeconds, fractionalSecondDigits)
+  const locales =
+    typeof navigator !== "undefined" ? navigator.languages : undefined
+  try {
+    return formatDurationParts(durationFormatCtor, locales, parts)
+  } catch (error) {
+    if (!(error instanceof RangeError)) {
+      return undefined
+    }
+  }
+  // A RangeError usually means an unsupported locale, so retry with the
+  // default locale. If that also fails, the caller shows the clock.
+  try {
+    return formatDurationParts(durationFormatCtor, undefined, parts)
+  } catch {
+    return undefined
+  }
+}
+
+/** Format non-negative seconds as an elapsed-time clock (e.g. `00:00:01.5`). */
+function formatDurationClock(
+  absSeconds: number,
+  fractionalSecondDigits: number
+): string {
+  const {
+    wholeSeconds,
+    fractionalTicks,
+    fractionalSecondDigits: digits,
+  } = splitDurationSeconds(absSeconds, fractionalSecondDigits)
+  const hours = Math.floor(wholeSeconds / 3600)
+  const minutes = Math.floor((wholeSeconds % 3600) / 60)
+  const remainingSeconds = wholeSeconds % 60
+  const pad = (value: number): string => String(value).padStart(2, "0")
+  const fractionalPart = fractionalTicks
+    ? `.${String(fractionalTicks).padStart(digits, "0").replace(/0+$/, "")}`
+    : ""
+  return `${pad(hours)}:${pad(minutes)}:${pad(remainingSeconds)}${fractionalPart}`
+}
+
+/**
+ * Duration displays for a value in seconds, named after the `NumberColumn`
+ * formats that select them.
+ */
+export type DurationFormat = "duration" | "compact" | "localized"
+
+/**
+ * Formats a duration that is already expressed in seconds.
+ *
+ * - `duration`: approximate humanized duration (e.g. "a few seconds",
+ *   "a day", "3 months").
+ * - `compact`: elapsed-time clock. Hours are not wrapped at 24, so multi-day
+ *   values stay a single reading (e.g. `336:00:00` for 14 days).
+ * - `localized`: exact, locale-aware duration from `Intl.DurationFormat`
+ *   (e.g. "5 sec", "1 sec, 500 ms"), or the `compact` clock in runtimes
+ *   without that API.
+ *
+ * `compact` and `localized` include sub-second parts up to
+ * `fractionalSecondDigits`. Negative values keep a leading minus.
+ */
+export function formatDurationFromSeconds(
+  seconds: number,
+  format: DurationFormat = "duration",
+  fractionalSecondDigits = 9
+): string {
+  if (!Number.isFinite(seconds)) {
+    return String(seconds)
+  }
+
+  const absSeconds = Math.abs(seconds)
+  let formatted: string
+  if (format === "compact") {
+    formatted = formatDurationClock(absSeconds, fractionalSecondDigits)
+  } else if (format === "localized") {
+    formatted =
+      formatDurationWithIntl(absSeconds, fractionalSecondDigits) ??
+      formatDurationClock(absSeconds, fractionalSecondDigits)
+  } else {
+    formatted = moment.duration(absSeconds, "seconds").humanize()
+  }
+  return seconds < 0 ? `-${formatted}` : formatted
+}
+
+/**
+ * Formats a duration value based on the unit information in the field.
+ *
+ * @param duration The duration value to format.
+ * @param field The field containing the unit information.
+ * @returns The formatted duration value.
+ */
+function formatDuration(duration: number | bigint, field?: Field): string {
+  // unit: 0 is seconds, 1 is milliseconds, 2 is microseconds, 3 is nanoseconds.
+  return formatDurationFromSeconds(
+    convertTimestampToSeconds(
+      duration,
+      // The default is NANOSECOND because that is the default unit for duration in pandas.
+      // Though we believe that actually always a unit is populated by arrow.
+      getArrowTimeUnit(field, TimeUnit.NANOSECOND)
+    )
+  )
+}
+
+/**
+ * Converts the raw words of an Arrow decimal to its unscaled integer.
+ *
+ * @param words The value as little-endian two's complement 32-bit words:
+ * 4 words for decimal128 and 8 words for decimal256.
+ * @returns The signed unscaled integer, e.g. -5 for -0.05 with scale 2.
+ */
+function decimalWordsToBigInt(words: Uint32Array): bigint {
+  let unscaled = BigInt(0)
+  for (let i = words.length - 1; i >= 0; i--) {
+    unscaled = (unscaled << BigInt(32)) | BigInt(words[i])
+  }
+  return BigInt.asIntN(words.length * 32, unscaled)
+}
+
+/**
+ * Formats a decimal value with a given scale to a string.
+ *
+ * This code is partly based on: https://github.com/apache/arrow/issues/35745
+ *
+ * ArrowJS has no decimal formatting of its own, and its `util.bigNumToString`
+ * returns wrong digits for decimal256 values. So the raw words are converted
+ * with a native BigInt instead. Related ArrowJS issues:
+ * https://github.com/apache/arrow/issues/37920
+ * https://github.com/apache/arrow/issues/28804
+ * https://github.com/apache/arrow/issues/35745
+ */
+function formatDecimal(value: Uint32Array, field?: Field): string {
+  const scale = getArrowScale(field)
+
+  // Format the unscaled integer to a numerical string. Negative numbers
+  // start with a minus sign.
+  let numString = decimalWordsToBigInt(value).toString()
+
+  if (scale === 0 || numString === "0") {
+    return numString
+  }
+
+  if (scale < 0) {
+    // A negative scale multiplies the unscaled integer by a power of ten,
+    // e.g. 123 with scale -2 is 12300.
+    return numString + "0".repeat(-scale)
+  }
+
+  let sign = ""
+  if (numString.startsWith("-")) {
+    // Check if number is negative, and if so remember the sign and remove it.
+    // We will add it back later.
+    sign = "-"
+    numString = numString.slice(1)
+  }
+  // Pad the digits (without the sign) with zeros so that they are at least
+  // as long as the scale, e.g. 5 with scale 3 is 0.005.
+  numString = numString.padStart(scale, "0")
+  // Extract the whole number part. If the number is < 1, it doesn't
+  // have a whole number part, so we'll use "0" instead.
+  // E.g for 123450 with scale 3, we'll get "123" as the whole part.
+  const wholePart = numString.slice(0, -scale) || "0"
+  // Extract the fractional part and remove trailing zeros.
+  // E.g. for 123450 with scale 3, we'll get "45" as the fractional part.
+  const decimalPart = trimEnd(numString.slice(-scale), "0") || ""
+  // Combine the parts and add the sign.
+  return `${sign}${wholePart}` + (decimalPart ? `.${decimalPart}` : "")
+}
+
+export function formatPeriodFromFreq(
+  duration: number | bigint,
+  freq: PandasPeriodFrequency
+): string {
+  const [freqName, freqParam] = freq.split("-", 2)
+  // freqName is an open pandas string. Indexing the Record types the result
+  // as always defined, so this cast keeps the missing-formatter check.
+  const momentConverter = PERIOD_TYPE_FORMATTERS[
+    freqName as SupportedPandasOffsetType
+  ] as PeriodFormatter | undefined
+  if (!momentConverter) {
+    LOG.warn(`Unsupported period frequency: ${freq}`)
+    return String(duration)
+  }
+  const durationNumber = Number(duration)
+  if (!Number.isSafeInteger(durationNumber)) {
+    LOG.warn(
+      `Unsupported value: ${duration}. Supported values: [${Number.MIN_SAFE_INTEGER}-${Number.MAX_SAFE_INTEGER}]`
+    )
+    return String(duration)
+  }
+  try {
+    return momentConverter(durationNumber, freqParam)
+  } catch (error) {
+    // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
+    LOG.warn(`Error while formatting period value: ${error}`)
+    return String(duration)
+  }
+}
+
+function formatPeriod(duration: number | bigint, field?: Field): string {
+  // Serialization for pandas.Period is provided by Arrow extensions
+  // https://github.com/pandas-dev/pandas/blob/70bb855cbbc75b52adcb127c84e0a35d2cd796a9/pandas/core/arrays/arrow/extension_types.py#L26
+  if (isNullOrUndefined(field)) {
+    LOG.warn("Field information is missing")
+    return String(duration)
+  }
+
+  const extensionName = field.metadata.get("ARROW:extension:name")
+  const extensionMetadata = field.metadata.get("ARROW:extension:metadata")
+
+  if (
+    isNullOrUndefined(extensionName) ||
+    isNullOrUndefined(extensionMetadata)
+  ) {
+    LOG.warn("Arrow extension metadata is missing")
+    return String(duration)
+  }
+
+  if (extensionName !== "pandas.period") {
+    LOG.warn(`Unsupported extension name for period type: ${extensionName}`)
+    return String(duration)
+  }
+
+  const parsedExtensionMetadata: unknown = JSON.parse(extensionMetadata)
+  if (
+    typeof parsedExtensionMetadata !== "object" ||
+    parsedExtensionMetadata === null ||
+    !("freq" in parsedExtensionMetadata)
+  ) {
+    LOG.warn("Arrow period extension metadata is missing freq")
+    return String(duration)
+  }
+  const { freq } = parsedExtensionMetadata
+  if (typeof freq !== "string") {
+    LOG.warn(`Unsupported period frequency: ${String(freq)}`)
+    return String(duration)
+  }
+  return formatPeriodFromFreq(duration, freq as PandasPeriodFrequency)
+}
+
+/**
+ * Formats nested arrays and other objects to a JSON string.
+ *
+ * @param object The value to format.
+ * @param field The field metadata from arrow containing metadata about the column.
+ * @returns The formatted JSON string.
+ */
+function formatObject(object: unknown, field?: Field): string {
+  if (field?.type instanceof Struct) {
+    // This type is used by python dictionary values
+
+    return JSON.stringify(object, (_key, value: unknown) => {
+      if (!notNullOrUndefined(value)) {
+        // Workaround: Arrow JS adds all properties from all cells
+        // as fields. When you convert to string, it will contain lots of fields with
+        // null values. To mitigate this, we filter out null values.
+        return undefined
+      }
+      if (typeof value === "bigint") {
+        // JSON.stringify fails to serialize bigint values, therefore we have to
+        // handle them manually.
+        // TODO(lukasmasuch): Would it be better to serialize it to a string to
+        // not lose precision?
+        return Number(value)
+      }
+      return value
+    })
+  }
+
+  // TODO(lukasmasuch): Investigate if we can unify this with the logic above.
+  return JSON.stringify(object, (_key, value: unknown) =>
+    typeof value === "bigint" ? Number(value) : value
+  )
+}
+
+/**
+ * Formats a float value to a string.
+ *
+ * @param num The float value to format.
+ * @returns The formatted float value.
+ */
+function formatFloat(num: number): string {
+  if (!Number.isFinite(num)) {
+    return String(num)
+  }
+
+  return numbro(num).format("0,0.0000")
+}
+
+/**
+ * Formats an interval value from arrow to string.
+ */
+function formatInterval(x: StructRow, field?: Field): string {
+  // pandas.Interval Arrow extension. Metadata is JSON from
+  // ArrowIntervalType.__arrow_ext_serialize__:
+  // https://github.com/pandas-dev/pandas/blob/235d9009b571c21b353ab215e1e675b1924ae55c/pandas/core/arrays/arrow/extension_types.py#L73
+  if (field?.metadata.get("ARROW:extension:name") === "pandas.interval") {
+    const rawMetadata = field.metadata.get("ARROW:extension:metadata")
+    if (typeof rawMetadata !== "string") {
+      LOG.warn("Arrow interval extension metadata is missing")
+      return String(x)
+    }
+
+    const extensionMetadata = parsePandasIntervalExtensionMetadata(rawMetadata)
+    if (extensionMetadata === undefined) {
+      LOG.warn(
+        "Arrow interval extension metadata must include string subtype and closed"
+      )
+      return String(x)
+    }
+    const { subtype, closed } = extensionMetadata
+
+    const interval = x.toJSON() as PandasInterval
+
+    const leftBracket = closed === "both" || closed === "left" ? "[" : "("
+    const rightBracket = closed === "both" || closed === "right" ? "]" : ")"
+
+    const leftInterval = format(interval.left, {
+      // Construct a arrow type for the left interval
+      type: DataFrameCellType.DATA,
+      pandasType: {
+        pandas_type: subtype,
+        numpy_type: subtype,
+        field_name: "",
+        name: "",
+        metadata: null,
+      },
+      arrowField: (field.type as Struct).children[0],
+    })
+    const rightInterval = format(interval.right, {
+      // Construct a arrow type for the right interval
+      type: DataFrameCellType.DATA,
+      pandasType: {
+        pandas_type: subtype,
+        numpy_type: subtype,
+        field_name: "",
+        name: "",
+        metadata: null,
+      },
+      arrowField: (field.type as Struct).children[1],
+    })
+
+    return `${leftBracket + leftInterval}, ${rightInterval + rightBracket}`
+  }
+  return String(x)
+}
+
+/** Takes the cell data and type metadata from arrow and nicely formats it into a human-readable string.
+ *
+ * This is mostly a best-effort logic and should not throw exceptions in case of unknown values
+ * or other issues. This makes it easier to use this method by consumers (table, dataframe) since
+ * they would have to somehow deal with the exception on a cell level to not crash the full table or app.
+ *
+ * @param x The cell value.
+ * @param pandasType The type metadata based on the pandas metadata embedded in the arrow table.
+ * @param field The field metadata from arrow containing metadata about the column.
+ * @returns The formatted cell value.
+ */
+export function format(x: DataType, type: ArrowType): string {
+  try {
+    if (isNullOrUndefined(x)) {
+      return ""
+    }
+
+    // Categorical cells hold the category value, e.g. an epoch timestamp for
+    // a date category, so format them with the category type.
+    const categoryType = getFormattableCategoryType(type)
+    if (notNullOrUndefined(categoryType)) {
+      return format(x, categoryType)
+    }
+
+    if (isStringType(type)) {
+      return String(x)
+    }
+
+    const isDate = x instanceof Date || Number.isFinite(x)
+    if (isDate && isDateType(type)) {
+      return formatDate(x as Date | number)
+    }
+
+    // time64 values are bigints, time32 values are numbers.
+    if ((typeof x === "bigint" || typeof x === "number") && isTimeType(type)) {
+      return formatTime(Number(x), type.arrowField)
+    }
+
+    if (isDate && isDatetimeType(type)) {
+      return formatDatetime(x as Date | number, type.arrowField)
+    }
+
+    if (isPeriodType(type)) {
+      return formatPeriod(x as bigint, type.arrowField)
+    }
+
+    if (isIntervalType(type)) {
+      return formatInterval(x as StructRow, type.arrowField)
+    }
+
+    if (isDurationType(type)) {
+      return formatDuration(x as number | bigint, type.arrowField)
+    }
+
+    if (isDecimalType(type)) {
+      return formatDecimal(x as Uint32Array, type.arrowField)
+    }
+
+    if (isFloatType(type) && Number.isFinite(x)) {
+      return formatFloat(x as number)
+    }
+
+    if (isObjectType(type) || isListType(type)) {
+      return formatObject(x, type.arrowField)
+    }
+  } catch (error) {
+    // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
+    LOG.warn(`Unexpected error occurred while formatting value: ${error}`)
+    // Fallback to string conversion if any error occurs.
+    // It's not expected that this happens, but we want to guard against
+    // any unexpected errors.
+    return String(x)
+  }
+
+  return String(x)
+}

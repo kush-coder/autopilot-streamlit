@@ -1,0 +1,380 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { useEffect, useMemo, useRef } from "react"
+
+import type {
+  CleanupFunction,
+  FrontendRendererArgs,
+  FrontendState,
+} from "@streamlit/component-v2-lib"
+import { generateUuid, isNullOrEmptyString } from "@streamlit/utils"
+
+import { BidiComponentContext } from "~lib/components/widgets/BidiComponent/BidiComponentContext"
+import { blobUrlManager } from "~lib/components/widgets/BidiComponent/utils/blobUrl"
+import {
+  handleError,
+  normalizeError,
+} from "~lib/components/widgets/BidiComponent/utils/error"
+import { makeTriggerAggregatorId } from "~lib/components/widgets/BidiComponent/utils/idBuilder"
+import { LOG } from "~lib/components/widgets/BidiComponent/utils/logger"
+import { useRequiredContext } from "~lib/hooks/useRequiredContext"
+import type { WidgetStateManager } from "~lib/WidgetStateManager"
+
+/**
+ * Security model
+ * ----------------
+ * This hook executes JavaScript authored by users or third parties as part of a
+ * Custom Component v2 instance. Streamlit does not sanitize or validate this
+ * content and makes no guarantees about what is executed. Inline JS is loaded
+ * via a Blob URL and external files via a module script; both run with normal
+ * DOM privileges.
+ *
+ * If you need to handle untrusted input, do not use this function without your
+ * own sanitization/defense-in-depth strategy.
+ */
+const loadAndRunModule = async <T extends FrontendState>({
+  componentId,
+  componentIdForWidgetMgr,
+  componentName,
+  data,
+  formId,
+  fragmentId,
+  getWidgetValue,
+  moduleUrl,
+  parentElement,
+  widgetMgr,
+}: {
+  componentId: string
+  componentIdForWidgetMgr: string
+  componentName: string
+  data: unknown
+  getWidgetValue: () => T
+  formId: string | undefined
+  fragmentId: string | undefined
+  moduleUrl: string
+  parentElement: HTMLElement | ShadowRoot
+  widgetMgr: WidgetStateManager
+}): Promise<CleanupFunction | void> => {
+  const module = (await import(/* @vite-ignore */ moduleUrl)) as {
+    default?: (
+      args: FrontendRendererArgs
+    ) => CleanupFunction | void | Promise<CleanupFunction | void>
+  }
+
+  if (!module.default || typeof module.default !== "function") {
+    throw new Error("JS module does not have a default export function.")
+  }
+
+  const setStateValue = <T extends FrontendState>(
+    name: string,
+    value: T[keyof T]
+  ): void => {
+    let newValue: T
+
+    try {
+      const existingValue = getWidgetValue()
+
+      newValue = { ...existingValue, [name]: value } as T
+    } catch (error) {
+      LOG.error(`Failed to get existing value for ${name}`, error)
+      newValue = { [name]: value } as T
+    }
+
+    void widgetMgr.setJsonValue(componentIdForWidgetMgr, newValue, {
+      formId,
+      fragmentId,
+      fromUser: true,
+    })
+  }
+
+  const setTriggerValue = <T extends FrontendState>(
+    name: string,
+    value: T[keyof T]
+  ): void => {
+    // IMPORTANT: Triggers are not allowed inside forms in Streamlit's execution
+    // model. Native buttons cannot be placed in forms, and form semantics defer
+    // updates until submit. To align CCv2 with existing behavior without
+    // changing global runtime semantics, we no-op trigger calls when the
+    // component is rendered inside a form. Developers should use setStateValue
+    // and the form submit button to commit changes.
+    if (!isNullOrEmptyString(formId)) {
+      LOG.warn(
+        "BidiComponent: setTriggerValue ignored inside st.form. Triggers are not allowed in forms; use setStateValue and form submit instead."
+      )
+      return
+    }
+    const triggerId = makeTriggerAggregatorId(componentIdForWidgetMgr)
+    void widgetMgr.setTriggerValue(
+      triggerId,
+      { formId, fragmentId, fromUser: true },
+      { event: name, value }
+    )
+  }
+
+  return module.default({
+    name: componentName,
+    data,
+    key: componentId,
+    parentElement,
+    setStateValue,
+    setTriggerValue,
+  } satisfies FrontendRendererArgs)
+}
+
+/**
+ * Load and execute CCv2 JavaScript for a component instance.
+ *
+ * Purpose
+ * -------
+ * Loads either inline JS (via Blob URL) or an external JS module URL and
+ * executes its default export to bootstrap a Custom Component v2 instance.
+ * Provides helpers for state updates and trigger events and wires errors into
+ * the component error surface.
+ *
+ * Security model
+ * --------------
+ * - Executes author-provided JavaScript with normal DOM privileges. Streamlit
+ *   does not sanitize or validate this code. Inline sources are loaded via a
+ *   Blob URL; external sources use a `<script type="module">` element and
+ *   dynamic `import()`.
+ * - Treat this as trusted code execution. If you must handle untrusted input,
+ *   sandbox or otherwise constrain execution yourself.
+ *
+ * When to use
+ * -----------
+ * - In CCv2 to initialize a component's runtime JS and integrate with
+ *   Streamlit's widget state management and trigger system.
+ *
+ * When NOT to use
+ * ---------------
+ * - Outside of the CCv2 lifecycle.
+ * - For arbitrary user-supplied JavaScript or content requiring isolation.
+ *
+ * @param containerRef - Parent `HTMLElement` or `ShadowRoot` where the module
+ *   can attach its UI.
+ * @param setError - Callback to report load/execute errors.
+ * @param skip - When true, skip loading/executing for this effect cycle.
+ */
+export const useHandleJsContent = ({
+  containerRef,
+  setError,
+  skip = false,
+}: {
+  containerRef: React.RefObject<HTMLElement | ShadowRoot>
+  setError: (error: Error) => void
+  skip?: boolean
+}): void => {
+  const thisUuid = useMemo(() => generateUuid(), [])
+  const componentId = `st-bidi-component-${thisUuid}`
+
+  const {
+    componentName,
+    data,
+    formId,
+    fragmentId,
+    getWidgetValue,
+    id,
+    jsContent: inlineJsContent,
+    jsSourcePath,
+    theme,
+    widgetMgr,
+    componentRegistry: { getBidiComponentURL },
+  } = useRequiredContext(BidiComponentContext)
+
+  const externalJsSourcePathUrl = useMemo(() => {
+    if (isNullOrEmptyString(jsSourcePath)) {
+      return undefined
+    }
+    return getBidiComponentURL(componentName, jsSourcePath)
+  }, [componentName, jsSourcePath, getBidiComponentURL])
+
+  // Lifecycle refs to ensure we only run the user-written JS cleanup function
+  // when the component is unmounted by Streamlit.
+  const cleanupRef = useRef<CleanupFunction | void>()
+  const scriptElementRef = useRef<HTMLScriptElement>()
+  const unmountedRef = useRef(false)
+
+  // Initialization/update effect: runs when inputs change
+  useEffect(() => {
+    const { current: containerRefCurrent } = containerRef
+    if (
+      skip ||
+      (isNullOrEmptyString(inlineJsContent) &&
+        externalJsSourcePathUrl === undefined) ||
+      !containerRefCurrent
+    ) {
+      return
+    }
+
+    let scriptElement: HTMLScriptElement | undefined
+    let resolveScriptLoad: (() => void) | undefined
+    let rejectScriptLoad: ((reason: Error) => void) | undefined
+    let cancelled = false
+    const handleScriptLoad = (): void => {
+      resolveScriptLoad?.()
+    }
+    const handleScriptError = (): void => {
+      rejectScriptLoad?.(
+        new Error(`Failed to load script from ${externalJsSourcePathUrl}`)
+      )
+    }
+
+    // If this run was cancelled after the module initialized, invoke its
+    // teardown instead of storing it — otherwise listeners/requests leak.
+    const adoptCleanup = (cleanup: CleanupFunction | void): void => {
+      if (!cancelled) {
+        cleanupRef.current = cleanup
+        return
+      }
+
+      void Promise.resolve(cleanup)
+        .then(result => result?.())
+        .catch((error: unknown) => {
+          LOG.error("Failed to run custom component cleanup", error)
+        })
+    }
+
+    const run = async (): Promise<void> => {
+      try {
+        if (!isNullOrEmptyString(inlineJsContent)) {
+          const { url } = blobUrlManager.getOrCreateUrlForJs(
+            inlineJsContent,
+            `st-bidi-${componentName}`
+          )
+
+          adoptCleanup(
+            await loadAndRunModule({
+              componentId,
+              componentIdForWidgetMgr: id,
+              componentName,
+              data,
+              formId,
+              fragmentId,
+              getWidgetValue,
+              moduleUrl: url,
+              parentElement: containerRefCurrent,
+              widgetMgr,
+            })
+          )
+        } else if (externalJsSourcePathUrl !== undefined) {
+          const scriptUrl = externalJsSourcePathUrl
+
+          try {
+            // Load the script
+            await new Promise<void>((resolve, reject) => {
+              scriptElement = document.createElement("script")
+              scriptElement.type = "module"
+              scriptElement.src = scriptUrl
+              scriptElement.async = true
+              resolveScriptLoad = resolve
+              rejectScriptLoad = reject
+              scriptElement.addEventListener("load", handleScriptLoad)
+              scriptElement.addEventListener("error", handleScriptError)
+              document.head.appendChild(scriptElement)
+              scriptElementRef.current = scriptElement
+            })
+
+            if (cancelled) {
+              return
+            }
+
+            adoptCleanup(
+              await loadAndRunModule({
+                componentId,
+                componentIdForWidgetMgr: id,
+                componentName,
+                data,
+                formId,
+                fragmentId,
+                getWidgetValue,
+                moduleUrl: scriptUrl,
+                parentElement: containerRefCurrent,
+                widgetMgr,
+              })
+            )
+          } catch (error) {
+            throw normalizeError(
+              error,
+              `Failed to load or execute script from ${externalJsSourcePathUrl}`
+            )
+          }
+        }
+      } catch (error) {
+        if (!unmountedRef.current) {
+          handleError(error, setError)
+        }
+      }
+    }
+
+    void run()
+
+    return () => {
+      cancelled = true
+      scriptElement?.removeEventListener("load", handleScriptLoad)
+      scriptElement?.removeEventListener("error", handleScriptError)
+      // Resolve rather than reject so a theme/data re-run does not flash a
+      // false component error; the `cancelled` flag then skips mounting the module.
+      resolveScriptLoad?.()
+      if (scriptElement?.parentNode) {
+        scriptElement.parentNode.removeChild(scriptElement)
+      }
+    }
+  }, [
+    componentId,
+    componentName,
+    containerRef,
+    data,
+    formId,
+    fragmentId,
+    getWidgetValue,
+    id,
+    inlineJsContent,
+    externalJsSourcePathUrl,
+    setError,
+    skip,
+    widgetMgr,
+    // We want to re-run the JS content on theme changes to ensure that any
+    // theme-dependent JS logic can be applied at the proper lifecycle time.
+    theme,
+  ])
+
+  // Unmount-only cleanup effect
+  useEffect(() => {
+    return () => {
+      unmountedRef.current = true
+
+      const maybeCleanup = cleanupRef.current
+      if (maybeCleanup) {
+        void Promise.resolve(maybeCleanup)
+          .then(result => {
+            // Return the cleanup result so a rejected async cleanup reaches the
+            // error logger. Calling `result()` without returning it would
+            // detach that rejection.
+            return result()
+          })
+          .catch((error: unknown) => {
+            LOG.error("Failed to run custom component cleanup", error)
+          })
+      }
+
+      const scriptElement = scriptElementRef.current
+      if (scriptElement?.parentNode) {
+        scriptElement.parentNode.removeChild(scriptElement)
+      }
+    }
+  }, [])
+}

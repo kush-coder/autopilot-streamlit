@@ -1,0 +1,396 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import styled from "@emotion/styled"
+
+import { type EmotionTheme, hasLightBackgroundColor } from "@streamlit/lib"
+
+import {
+  getSidebarResizeHandleBackgroundImage,
+  getSidebarResizeHandleHoverBorderColor,
+} from "./utils"
+
+/**
+ * Returns the horizontal spacing for the sidebar, taking into consideration
+ * the scrollbar gutters (one on each side) which are present when the OS
+ * doesn't support overlay scrollbars.
+ *
+ * @param theme The theme to use.
+ * @returns The horizontal spacing for the sidebar.
+ */
+const getSidebarHorizontalSpacing = (
+  theme: EmotionTheme,
+  scrollbarGutterSize: number
+): string => {
+  // This should be max(0px, ...), but there's a Chrome bug that
+  // causes content to clip when scrollbar-gutter is set to "stable both-edges".
+  // So we change the min from 0px to scrollbarGutterSize to account for that.
+  // Chrome bug: https://issues.chromium.org/issues/40064879
+  return `max(
+    ${scrollbarGutterSize}px,
+    calc(${theme.spacing.xl} - ${scrollbarGutterSize}px)
+  )`
+}
+
+interface StyledSidebarProps {
+  isCollapsed: boolean
+  adjustTop: boolean
+  sidebarWidth: string
+  windowInnerWidth: number
+}
+
+export const StyledSidebar = styled.section<StyledSidebarProps>(
+  ({ theme, isCollapsed, adjustTop, sidebarWidth, windowInnerWidth }) => {
+    const minWidth = isCollapsed
+      ? 0
+      : `min(${theme.sizes.minSidebarWidth}, ${windowInnerWidth}px)`
+    const maxWidth = isCollapsed
+      ? 0
+      : `min(${theme.sizes.maxSidebarWidth}, ${windowInnerWidth * 0.9}px)`
+
+    return {
+      position: "relative",
+      // Nudge the sidebar by 2px so the header decoration doesn't go below it
+      top: adjustTop ? theme.sizes.headerDecorationHeight : theme.spacing.none,
+      backgroundColor: theme.colors.bgColor,
+      // Since the sidebar can have a different theme (+ background)
+      // we need to explicitly set the font color and color scheme
+      // here again so that it is inherited correctly by all sidebar elements:
+      color: theme.colors.bodyText,
+      colorScheme: hasLightBackgroundColor(theme) ? "light" : "dark",
+      zIndex: theme.zIndices.header + 1,
+
+      minWidth,
+      maxWidth,
+      transform: isCollapsed ? `translateX(-${sidebarWidth}px)` : "none",
+      transition: "transform 300ms, min-width 300ms, max-width 300ms",
+
+      "&:focus": {
+        outline: "none",
+      },
+
+      [`@media (max-width: ${theme.breakpoints.md})`]: {
+        boxShadow: isCollapsed
+          ? "-2rem 0 2rem 2rem transparent"
+          : theme.shadows.sidebar,
+      },
+
+      [`@media print`]: {
+        display: isCollapsed ? "none" : "initial",
+        // Stay a side column as tall as the printed main content, so its
+        // background does not end partway down the page. A max-height of
+        // one page would clip a sidebar that is longer than the page.
+        alignSelf: "stretch",
+        height: "auto !important",
+        maxHeight: "none !important",
+        // Override the inline width from re-resizable (set by
+        // `st.set_page_config(initial_sidebar_state=<int>)` or by dragging)
+        // with `minSidebarWidth`, so a wide sidebar does not crowd out the
+        // main column when printed.
+        width: `${theme.sizes.minSidebarWidth} !important`,
+        minWidth: `${theme.sizes.minSidebarWidth} !important`,
+        maxWidth: `${theme.sizes.minSidebarWidth} !important`,
+        flex: `0 0 ${theme.sizes.minSidebarWidth}`,
+        // on Chrome, sth. adds a box-shadow in printing mode which looks weird
+        boxShadow: "none",
+      },
+    }
+  }
+)
+
+interface StyledSidebarUserContentProps {
+  hasPageNavAbove: boolean
+}
+
+export const StyledSidebarUserContent =
+  styled.div<StyledSidebarUserContentProps>(({ hasPageNavAbove, theme }) => {
+    const configuredTop = theme.paddingTop
+
+    let paddingTop: string | number
+    if (configuredTop !== undefined) {
+      // Set + page nav: gap goes onto user-content paddingTop (header→nav already separate)
+      // Set + no nav:   gap goes onto header marginBottom (see StyledSidebarHeaderContainer)
+      paddingTop = hasPageNavAbove ? configuredTop : 0
+    } else {
+      // Unset keeps the built-in gap: twoXL under page nav, otherwise none.
+      paddingTop = hasPageNavAbove ? theme.spacing.twoXL : 0
+    }
+
+    const paddingBottom = theme.paddingBottom ?? theme.sizes.sidebarTopSpace
+
+    return { paddingTop, paddingBottom }
+  })
+
+interface StyledSidebarContentProps {
+  scrollbarGutterSize: number
+}
+
+export const StyledSidebarContent = styled.div<StyledSidebarContentProps>(
+  ({ theme, scrollbarGutterSize }) => ({
+    position: "relative",
+    height: "100%",
+    width: "100%",
+    overflow: "auto",
+    /**
+     * Ensure that space is reserved for scrollbars, even when they are not
+     * visible. This is necessary to prevent layout shifts when the scrollbars
+     * appear and disappear.
+     *
+     * We utilize both-edges so that things look visually centered and aligned.
+     *
+     * @see https://github.com/streamlit/streamlit/issues/10310
+     */
+    scrollbarGutter: "stable both-edges",
+    paddingLeft: getSidebarHorizontalSpacing(theme, scrollbarGutterSize),
+    paddingRight: getSidebarHorizontalSpacing(theme, scrollbarGutterSize),
+
+    "@media print": {
+      // The on-screen scroller clips anything past one page. Let the column
+      // print through to the next page instead.
+      height: "auto",
+      maxHeight: "none",
+      overflow: "visible",
+    },
+  })
+)
+
+export const RESIZE_HANDLE_WIDTH = "8px"
+
+export const StyledResizeHandle = styled.div(({ theme }) => {
+  const { borderColor } = theme.colors
+  // When the border is already visible, bump opacity on hover. Hidden-border
+  // hover still reveals the un-bumped borderColor via the gradient below.
+  const hoverBorderColor = theme.showSidebarBorder
+    ? getSidebarResizeHandleHoverBorderColor(borderColor)
+    : borderColor
+
+  return {
+    position: "absolute",
+    width: RESIZE_HANDLE_WIDTH,
+    height: "100%",
+    cursor: "col-resize",
+    zIndex: theme.zIndices.sidebarMobile,
+    backgroundImage: theme.showSidebarBorder
+      ? getSidebarResizeHandleBackgroundImage(borderColor, {
+          isHovered: false,
+        })
+      : "none",
+
+    "&:hover": {
+      backgroundImage: getSidebarResizeHandleBackgroundImage(
+        hoverBorderColor,
+        {
+          isHovered: true,
+        }
+      ),
+    },
+  }
+})
+
+interface StyledSidebarHeaderContainerProps {
+  hasPageNavAbove: boolean
+}
+
+export const StyledSidebarHeaderContainer =
+  styled.div<StyledSidebarHeaderContainerProps>(
+    ({ hasPageNavAbove, theme }) => {
+      const configuredTop = theme.paddingTop
+
+      // When paddingTop is configured and there is no page nav, the gap between
+      // chrome and the first widget is expressed as marginBottom on this header
+      // row (the header→nav spacing stays at spacing.lg when nav is present).
+      const marginBottom =
+        configuredTop !== undefined && !hasPageNavAbove
+          ? configuredTop
+          : theme.spacing.lg
+
+      return {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        marginBottom,
+        height: theme.sizes.headerHeight,
+      }
+    }
+  )
+
+/** Logo wrappers set minWidth: 0 so a wide image can shrink below its
+ * intrinsic width instead of crowding the collapse button. */
+export const StyledSidebarLogoSlot = styled.div({
+  display: "flex",
+  alignItems: "center",
+  flex: "1 1 auto",
+  minWidth: 0,
+  maxWidth: "100%",
+})
+
+export const StyledLogoInnerWrap = styled.div({
+  maxWidth: "100%",
+  minWidth: 0,
+  display: "flex",
+})
+
+// Keeps logos inside the header row. The sidebar header and app header share
+// theme.sizes.headerHeight.
+const logoMaxHeight = (theme: EmotionTheme): string =>
+  `calc(${theme.sizes.headerHeight} - 2 * ${theme.spacing.twoXS})`
+
+export const StyledLogoLink = styled.a({
+  maxWidth: "100%",
+  minWidth: 0,
+  display: "flex",
+  "&:hover": {
+    opacity: "0.7",
+  },
+})
+
+export const StyledLogoButton = styled.button({
+  // Reset button styles
+  background: "none",
+  border: "none",
+  padding: 0,
+  cursor: "pointer",
+  maxWidth: "100%",
+  minWidth: 0,
+  display: "flex",
+  "&:hover": {
+    opacity: "0.7",
+  },
+})
+
+interface StyledLogoProps {
+  size: string
+  sizePx?: number
+  sidebarWidth?: string
+}
+
+function translateLogoHeight(
+  theme: EmotionTheme,
+  size: string,
+  sizePx?: number
+): string {
+  if (sizePx && sizePx > 0) {
+    return `${sizePx}px`
+  }
+  if (size === "small") {
+    return theme.sizes.smallLogoHeight
+  } else if (size === "large") {
+    return theme.sizes.largeLogoHeight
+  }
+  // Default logo size
+  return theme.sizes.defaultLogoHeight
+}
+
+function logoVerticalMargin(
+  theme: EmotionTheme,
+  size: string,
+  sizePx?: number
+): string {
+  // Extra margin to align the small preset with the sidebar collapse arrow.
+  // Pixel sizes use the default (non-small) margin.
+  if (!sizePx && size === "small") {
+    return theme.spacing.xs
+  }
+  return theme.spacing.twoXS
+}
+
+const logoBoxStyles = ({
+  theme,
+  size,
+  sizePx,
+}: {
+  theme: EmotionTheme
+  size: string
+  sizePx?: number
+}): Record<string, string> => {
+  const requestedHeight = translateLogoHeight(theme, size, sizePx)
+  // Presets always fit the header row; only author-supplied pixel heights
+  // need the cap.
+  const height =
+    sizePx && sizePx > 0
+      ? `min(${requestedHeight}, ${logoMaxHeight(theme)})`
+      : requestedHeight
+  const verticalMargin = logoVerticalMargin(theme, size, sizePx)
+  return {
+    height,
+    marginTop: verticalMargin,
+    marginBottom: verticalMargin,
+    marginLeft: theme.spacing.none,
+    maxWidth: "100%",
+  }
+}
+
+export const StyledLogo = styled.img<StyledLogoProps>(
+  ({ theme, size, sizePx }) => ({
+    ...logoBoxStyles({ theme, size, sizePx }),
+    zIndex: theme.zIndices.header,
+    objectFit: "contain",
+    objectPosition: "left",
+    verticalAlign: "middle",
+  })
+)
+
+export const StyledIconLogo = styled.div<StyledLogoProps>(
+  ({ theme, size, sizePx }) => {
+    const boxStyles = logoBoxStyles({ theme, size, sizePx })
+    return {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "flex-start",
+      ...boxStyles,
+      zIndex: theme.zIndices.header,
+      fontSize: boxStyles.height,
+      lineHeight: theme.lineHeights.none,
+      color: theme.colors.bodyText,
+    }
+  }
+)
+
+export const StyledNoLogoSpacer = styled.div(({ theme }) => ({
+  height: theme.sizes.largeLogoHeight,
+}))
+
+interface StyledCollapseSidebarButtonProps {
+  showSidebarCollapse: boolean
+}
+
+export const StyledCollapseSidebarButton =
+  styled.div<StyledCollapseSidebarButtonProps>(
+    ({ showSidebarCollapse, theme }) => {
+      return {
+        display: "inline",
+        flexShrink: 0,
+        visibility: showSidebarCollapse ? "visible" : "hidden",
+        marginLeft: theme.spacing.sm,
+        transition: "left 300ms",
+        transitionDelay: "left 300ms",
+        color: hasLightBackgroundColor(theme)
+          ? theme.colors.fadedText60
+          : theme.colors.bodyText,
+        lineHeight: "0",
+
+        [`@media print`]: {
+          // Always hide the collapse button on print:
+          visibility: "hidden",
+        },
+
+        [`@media (max-width: ${theme.breakpoints.sm})`]: {
+          // Always show the collapse button on small screens:
+          visibility: "visible",
+        },
+      }
+    }
+  )

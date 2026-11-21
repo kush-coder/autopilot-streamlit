@@ -1,0 +1,451 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import {
+  type JSX,
+  memo,
+  type ReactElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
+
+import { ChevronLeft, ChevronRight } from "@emotion-icons/material-outlined"
+import { type Key, SelectionIndicator } from "react-aria-components"
+
+import { isNullOrEmptyString } from "@streamlit/utils"
+
+import type { AppNode, BlockNode } from "~lib/AppNode"
+import type { BlockPropsWithoutWidth } from "~lib/components/core/Block/Block"
+import {
+  convertKeyToClassName,
+  getKeyFromId,
+  isElementStale,
+} from "~lib/components/core/Block/utils"
+import { ScriptRunContext } from "~lib/components/core/ScriptRunContext"
+import Icon from "~lib/components/shared/Icon/Icon"
+import { PRINT_INACTIVE_ATTRIBUTE } from "~lib/components/shared/printPageBreak"
+import StreamlitMarkdown from "~lib/components/shared/StreamlitMarkdown/StreamlitMarkdown"
+import { useHorizontalScrollOverflow } from "~lib/hooks/useHorizontalScrollOverflow"
+import { useQueryParamBinding } from "~lib/hooks/useQueryParamBinding"
+import type { WidgetStateManager } from "~lib/WidgetStateManager"
+
+import {
+  StyledScrollArrow,
+  StyledTab,
+  StyledTabContainer,
+  StyledTabList,
+  StyledTabPanel,
+  StyledTabsRoot,
+} from "./styled-components"
+
+const SCROLL_AMOUNT = 200
+
+/**
+ * Look up the persisted active tab label from elementStates and resolve
+ * it to an index in the current tab list. Returns null if nothing is
+ * stored or the stored label no longer matches any tab.
+ */
+function getPersistedTabIndex(
+  widgetMgr: WidgetStateManager,
+  blockId: string,
+  allTabLabels: string[]
+): { index: number; label: string } | null {
+  const stored = widgetMgr.getElementState<string>(blockId, "activeTabLabel")
+  if (isNullOrEmptyString(stored)) return null
+  const idx = allTabLabels.indexOf(stored)
+  return idx >= 0 ? { index: idx, label: stored } : null
+}
+
+export interface TabProps extends BlockPropsWithoutWidth {
+  widgetsDisabled: boolean
+  node: BlockNode
+  isStale: boolean
+  renderTabContent: (
+    childProps: JSX.IntrinsicAttributes & BlockPropsWithoutWidth
+  ) => ReactElement
+  width: React.CSSProperties["width"]
+  height?: React.CSSProperties["height"]
+  flex: React.CSSProperties["flex"]
+  alignSelf?: React.CSSProperties["alignSelf"]
+  minHeight?: React.CSSProperties["minHeight"]
+  maxHeight?: React.CSSProperties["maxHeight"]
+  fragmentId?: string
+}
+
+function Tabs(props: Readonly<TabProps>): ReactElement {
+  const {
+    widgetsDisabled,
+    node,
+    isStale,
+    width,
+    height,
+    flex,
+    alignSelf,
+    minHeight,
+    maxHeight,
+    widgetMgr,
+    fragmentId,
+  } = props
+  const { scriptRunState, scriptRunId, fragmentIdsThisRun } =
+    useContext(ScriptRunContext)
+  const defaultTabIndex = node.deltaBlock.tabContainer?.defaultTabIndex ?? 0
+  const tabContainer = node.deltaBlock.tabContainer
+  // widgetId is only set when the backend registers tabs as a stateful widget
+  // (on_change="rerun" or bind="query-params"). blockId is set whenever key= is provided.
+  const widgetId = tabContainer?.id
+  const blockId = node.deltaBlock.id ?? ""
+  const isDynamic = Boolean(widgetId)
+  // Passive keyed tabs: have a stable blockId (key= provided) but are NOT
+  // dynamic widgets (no on_change="rerun" or bind="query-params"). These persist
+  // the active tab label in elementStates so the selection survives component
+  // remounts. Dynamic tabs are excluded because the backend manages their state
+  // via session_state.
+  const isPassivelyKeyed = Boolean(blockId) && !isDynamic
+  const userKey = getKeyFromId(blockId)
+
+  // Memoize tab labels to prevent unnecessary effect reruns
+  const allTabLabels = useMemo(
+    () =>
+      node.children.map(
+        (child, index) =>
+          (child as BlockNode).deltaBlock.tab?.label ?? index.toString()
+      ),
+    [node.children]
+  )
+
+  // Bind against the original default label, not the active tab.
+  // defaultTabIndex is the current selection; using it as the omit-default
+  // target would leave the param in the URL after switching back to default=.
+  useQueryParamBinding(
+    widgetMgr,
+    widgetId ?? "",
+    isDynamic ? (tabContainer?.queryParamKey ?? null) : null,
+    "string_value",
+    tabContainer?.defaultTabLabel ?? "",
+    false
+  )
+
+  // Memoize stale flags once so both the tab-button and tab-panel maps share
+  // the same computation instead of calling isElementStale twice per child.
+  const staleTabFlags = useMemo(
+    () =>
+      node.children.map(appNode =>
+        isElementStale(
+          appNode,
+          scriptRunState,
+          scriptRunId,
+          fragmentIdsThisRun
+        )
+      ),
+    [node.children, scriptRunState, scriptRunId, fragmentIdsThisRun]
+  )
+
+  const [activeTabKey, setActiveTabKey] = useState<number>(() => {
+    if (isPassivelyKeyed) {
+      const persisted = getPersistedTabIndex(widgetMgr, blockId, allTabLabels)
+      if (persisted) return persisted.index
+    }
+    return defaultTabIndex
+  })
+  const activeTabNameRef = useRef<string | undefined>(undefined)
+  if (activeTabNameRef.current === undefined) {
+    if (isPassivelyKeyed) {
+      const persisted = getPersistedTabIndex(widgetMgr, blockId, allTabLabels)
+      if (persisted) {
+        activeTabNameRef.current = persisted.label
+      }
+    }
+
+    if (activeTabNameRef.current === undefined) {
+      // The tab container can render before all of its tab blocks arrive.
+      const tab = node.children[defaultTabIndex] as BlockNode | undefined
+      activeTabNameRef.current = tab?.deltaBlock.tab?.label ?? "0"
+    }
+  }
+
+  const tabListRef = useRef<HTMLDivElement>(null)
+  const { canScrollLeft, canScrollRight } = useHorizontalScrollOverflow({
+    elementRef: tabListRef,
+    enabled: true,
+    layoutKey: allTabLabels.join("\0"),
+  })
+  const isOverflowing = canScrollLeft || canScrollRight
+
+  // Scroll the tabs by a fixed amount
+  const scroll = useCallback((direction: "left" | "right"): void => {
+    tabListRef.current?.scrollBy({
+      left: direction === "left" ? -SCROLL_AMOUNT : SCROLL_AMOUNT,
+      behavior: "smooth",
+    })
+  }, [])
+
+  const handleScrollLeft = useCallback((): void => scroll("left"), [scroll])
+  const handleScrollRight = useCallback((): void => scroll("right"), [scroll])
+
+  // Track previous defaultTabIndex to detect backend changes
+  const prevDefaultTabIndexRef = useRef<number>(defaultTabIndex)
+
+  // Sync tab selection when defaultTabIndex changes programmatically
+  // (only for dynamic tabs with programmatic control)
+  useEffect(() => {
+    if (isDynamic && allTabLabels.length > 0) {
+      const tabIndexChanged =
+        defaultTabIndex !== prevDefaultTabIndexRef.current
+
+      if (tabIndexChanged) {
+        const newLabel = allTabLabels[defaultTabIndex]
+        if (newLabel) {
+          setActiveTabKey(defaultTabIndex)
+          activeTabNameRef.current = newLabel
+          // Keep the widget manager in sync with the backend-driven tab change.
+          // Without this, subsequent reruns would send a stale widget value that
+          // overrides session_state, making tab.open return False for the new tab.
+          // fromUser: false avoids scheduling a spurious rerun.
+          if (!isNullOrEmptyString(widgetId)) {
+            widgetMgr.setStringValue(widgetId, newLabel, {
+              formId: "",
+              fragmentId,
+              fromUser: false,
+            })
+          }
+        }
+        prevDefaultTabIndexRef.current = defaultTabIndex
+      }
+    }
+  }, [
+    defaultTabIndex,
+    isDynamic,
+    allTabLabels,
+    widgetId,
+    widgetMgr,
+    fragmentId,
+  ])
+
+  // Reconciles active key & tab name when tab list changes.
+  // When isPassivelyKeyed, also check elementStates so that the persisted
+  // label survives even if the tracked active label no longer matches a tab.
+  // The fallback is not persisted: a block shifted to a new delta path briefly
+  // renders with the tabs it inherited from that path, and persisting a
+  // fallback then would overwrite the user's selection.
+  useEffect(() => {
+    if (isPassivelyKeyed) {
+      const persisted = getPersistedTabIndex(widgetMgr, blockId, allTabLabels)
+      if (persisted) {
+        setActiveTabKey(persisted.index)
+        activeTabNameRef.current = persisted.label
+        return
+      }
+    }
+
+    const newTabKey = allTabLabels.indexOf(activeTabNameRef.current ?? "0")
+    if (newTabKey === -1) {
+      setActiveTabKey(defaultTabIndex)
+      activeTabNameRef.current = allTabLabels[defaultTabIndex]
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- TODO: Update to match React best practices
+  }, [allTabLabels])
+
+  // Scroll the active tab into view when the selection changes programmatically
+  // (e.g. defaultTabIndex update, passive state restore). block:"nearest" avoids
+  // vertical page scroll; inline:"nearest" only scrolls if the tab is not visible.
+  // Respects the OS reduced-motion preference by using "instant" when set.
+  useEffect(() => {
+    const tabList = tabListRef.current
+    if (!tabList) return
+    const activeTab = tabList.querySelector<HTMLElement>(
+      "[aria-selected='true']"
+    )
+    const reduceMotion = window.matchMedia(
+      "(prefers-reduced-motion: reduce)"
+    ).matches
+    activeTab?.scrollIntoView({
+      behavior: reduceMotion ? "instant" : "smooth",
+      block: "nearest",
+      inline: "nearest",
+    })
+  }, [activeTabKey])
+
+  useEffect(() => {
+    // If tab # changes, match the selected tab label, otherwise default to first tab.
+    // When isPassivelyKeyed, prefer the stored label over the tracked ref value.
+    if (isPassivelyKeyed) {
+      const persisted = getPersistedTabIndex(widgetMgr, blockId, allTabLabels)
+      if (persisted) {
+        setActiveTabKey(persisted.index)
+        activeTabNameRef.current = persisted.label
+        return
+      }
+    }
+
+    const newTabKey = allTabLabels.indexOf(activeTabNameRef.current ?? "0")
+    if (newTabKey !== -1) {
+      setActiveTabKey(newTabKey)
+      activeTabNameRef.current = allTabLabels[newTabKey]
+    } else {
+      setActiveTabKey(defaultTabIndex)
+      activeTabNameRef.current = allTabLabels[defaultTabIndex]
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: only re-run when tab count changes; other deps are stable across renders
+  }, [node.children.length])
+
+  const handleSelectionChange = useCallback(
+    (key: Key): void => {
+      const newIndex = Number(key)
+      // RAC guarantees key matches the id prop passed to <Tab> (always String(index)),
+      // but guard against NaN in case id generation ever changes.
+      if (Number.isNaN(newIndex)) return
+      // RAC also reports the already-active key (clicking the active tab,
+      // Home on the first tab, End on the last); skip it so dynamic tabs
+      // don't rerun without a change.
+      if (newIndex === activeTabKey) return
+      const newLabel = allTabLabels[newIndex]
+      setActiveTabKey(newIndex)
+      activeTabNameRef.current = newLabel
+
+      if (isPassivelyKeyed) {
+        widgetMgr.setElementState(blockId, "activeTabLabel", newLabel)
+      }
+
+      if (isDynamic && !isNullOrEmptyString(widgetId)) {
+        widgetMgr.setStringValue(widgetId, newLabel, {
+          formId: "",
+          fragmentId,
+          fromUser: true,
+        })
+      }
+    },
+    [
+      activeTabKey,
+      allTabLabels,
+      blockId,
+      fragmentId,
+      isDynamic,
+      isPassivelyKeyed,
+      widgetId,
+      widgetMgr,
+    ]
+  )
+
+  const hasConstrainedHeight = height !== undefined
+
+  return (
+    <StyledTabContainer
+      className={["stTabs", convertKeyToClassName(userKey)]
+        .filter(Boolean)
+        .join(" ")}
+      data-testid="stTabs"
+      isOverflowing={isOverflowing}
+      width={width}
+      height={height}
+      flex={flex}
+      alignSelf={alignSelf}
+      minHeight={minHeight}
+      maxHeight={maxHeight}
+    >
+      <StyledTabsRoot
+        selectedKey={String(activeTabKey)}
+        onSelectionChange={handleSelectionChange}
+        $constrainedHeight={hasConstrainedHeight}
+      >
+        <StyledTabList ref={tabListRef} $isStale={isStale}>
+          {node.children.map(
+            (_appNode: AppNode, index: number): ReactElement => {
+              const isStaleTab = staleTabFlags[index]
+              const nodeLabel = allTabLabels[index] ?? index.toString()
+              return (
+                <StyledTab
+                  data-testid="stTab"
+                  id={String(index)}
+                  // TODO: Update to match React best practices
+                  // eslint-disable-next-line @eslint-react/no-array-index-key
+                  key={index}
+                  isDisabled={!isStale && isStaleTab}
+                  $isStale={!isStale && isStaleTab}
+                >
+                  <StreamlitMarkdown
+                    source={nodeLabel}
+                    allowHTML={false}
+                    isLabel
+                  />
+                  <SelectionIndicator />
+                </StyledTab>
+              )
+            }
+          )}
+        </StyledTabList>
+        {/* shouldForceMount keeps all panels in the DOM to preserve scroll position
+            when switching tabs: https://github.com/streamlit/streamlit/issues/5069 */}
+        {node.children.map(
+          (_appNode: AppNode, index: number): ReactElement => {
+            const isStaleTab = staleTabFlags[index]
+            const childProps = {
+              ...props,
+              isStale: isStale || isStaleTab,
+              widgetsDisabled,
+              node: node.children[index] as BlockNode,
+            }
+            return (
+              <StyledTabPanel
+                // TODO: Update to match React best practices
+                // eslint-disable-next-line @eslint-react/no-array-index-key
+                key={index}
+                data-testid="stTabPanel"
+                id={String(index)}
+                // A closed panel stays mounted but is not printed. Print
+                // layout uses this to ignore the charts and dataframes inside it.
+                {...{
+                  [PRINT_INACTIVE_ATTRIBUTE]:
+                    activeTabKey === index ? undefined : "",
+                }}
+                $isActive={activeTabKey === index}
+                shouldForceMount
+                $constrainedHeight={hasConstrainedHeight}
+              >
+                {props.renderTabContent(childProps)}
+              </StyledTabPanel>
+            )
+          }
+        )}
+      </StyledTabsRoot>
+      {canScrollLeft && (
+        <StyledScrollArrow
+          position="left"
+          onClick={handleScrollLeft}
+          aria-label="Scroll tabs left"
+          data-testid="stTabsScrollLeft"
+        >
+          <Icon content={ChevronLeft} size="lg" />
+        </StyledScrollArrow>
+      )}
+      {canScrollRight && (
+        <StyledScrollArrow
+          position="right"
+          onClick={handleScrollRight}
+          aria-label="Scroll tabs right"
+          data-testid="stTabsScrollRight"
+        >
+          <Icon content={ChevronRight} size="lg" />
+        </StyledScrollArrow>
+      )}
+    </StyledTabContainer>
+  )
+}
+
+export default memo(Tabs)

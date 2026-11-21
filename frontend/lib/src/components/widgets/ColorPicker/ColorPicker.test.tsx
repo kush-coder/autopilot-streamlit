@@ -1,0 +1,500 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { act, screen } from "@testing-library/react"
+import { userEvent } from "@testing-library/user-event"
+
+import { ColorPicker as ColorPickerProto } from "@streamlit/protobuf"
+
+import { render } from "~lib/test_util"
+import { WidgetStateManager } from "~lib/WidgetStateManager"
+
+import ColorPicker, { type Props } from "./ColorPicker"
+
+const getProps = (
+  elementProps: Partial<ColorPickerProto> = {},
+  widgetProps: Partial<Props> = {}
+): Props => ({
+  element: ColorPickerProto.create({
+    id: "1",
+    label: "Label",
+    default: "#000000",
+    ...elementProps,
+  }),
+  disabled: false,
+  widgetMgr: new WidgetStateManager({
+    sendRerunBackMsg: vi.fn(),
+    formsDataChanged: vi.fn(),
+  }),
+  ...widgetProps,
+})
+
+describe("ColorPicker widget", () => {
+  it("renders without crashing", () => {
+    const props = getProps()
+    render(<ColorPicker {...props} />)
+    const colorPicker = screen.getByTestId("stColorPicker")
+    expect(colorPicker).toBeInTheDocument()
+    expect(colorPicker).toHaveClass("stColorPicker")
+  })
+
+  it("sets widget value on mount", () => {
+    const props = getProps()
+    vi.spyOn(props.widgetMgr, "setStringValue")
+
+    render(<ColorPicker {...props} />)
+
+    expect(props.widgetMgr.setStringValue).toHaveBeenCalledWith(
+      props.element.id,
+      props.element.default,
+      { formId: props.element.formId, fragmentId: undefined, fromUser: false }
+    )
+  })
+
+  it("can pass fragmentId to setStringValue", () => {
+    const props = getProps(undefined, { fragmentId: "myFragmentId" })
+    vi.spyOn(props.widgetMgr, "setStringValue")
+
+    render(<ColorPicker {...props} />)
+
+    expect(props.widgetMgr.setStringValue).toHaveBeenCalledWith(
+      props.element.id,
+      props.element.default,
+      {
+        formId: props.element.formId,
+        fragmentId: "myFragmentId",
+        fromUser: false,
+      }
+    )
+  })
+
+  it("renders a default color in the preview and the color picker", async () => {
+    const user = userEvent.setup()
+    const props = getProps()
+    render(<ColorPicker {...props} />)
+
+    const colorBlock = screen.getByTestId("stColorPickerBlock")
+    await user.click(colorBlock)
+    expect(colorBlock).toHaveStyle("background-color: #000000")
+
+    const colorInput = screen.getByRole("textbox")
+    expect(colorInput).toHaveValue("#000000")
+  })
+
+  it("updates its widget value when it's changed", async () => {
+    const user = userEvent.setup()
+    const props = getProps()
+    vi.spyOn(props.widgetMgr, "setStringValue")
+
+    render(<ColorPicker {...props} />)
+
+    // Open the color picker
+    const colorBlock = screen.getByTestId("stColorPickerBlock")
+    await user.click(colorBlock)
+
+    // Clear the color input text field
+    const colorInput = screen.getByRole("textbox")
+    await user.tripleClick(colorInput)
+    await user.keyboard("{backspace}")
+
+    // Enter the new color in the input field
+    const newColor = "#e91e63"
+    await user.type(colorInput, newColor)
+
+    // Close out of the popover
+    await user.click(colorBlock)
+
+    // And the WidgetMgr should also be updated.
+    expect(props.widgetMgr.setStringValue).toHaveBeenLastCalledWith(
+      props.element.id,
+      newColor,
+      { formId: props.element.formId, fragmentId: undefined, fromUser: true }
+    )
+  })
+
+  it("resets its value when form is cleared", async () => {
+    // Create a widget in a clearOnSubmit form
+    const user = userEvent.setup()
+    const props = getProps({ formId: "form" })
+    vi.spyOn(props.widgetMgr, "setStringValue")
+    props.widgetMgr.setFormSubmitBehaviors("form", true)
+
+    render(<ColorPicker {...props} />)
+
+    // Open the color picker
+    const colorBlock = screen.getByTestId("stColorPickerBlock")
+    await user.click(colorBlock)
+
+    // Clear the color input text field
+    const colorInput = screen.getByRole("textbox")
+    await user.tripleClick(colorInput)
+    await user.keyboard("{backspace}")
+
+    // Enter the new color in the input field
+    const newColor = "#e91e63"
+    await user.type(colorInput, newColor)
+
+    // Close out of the popover
+    await user.click(colorBlock)
+
+    expect(colorInput).toHaveValue(newColor.toUpperCase())
+    expect(colorBlock).toHaveStyle(`background-color: ${newColor}`)
+    expect(props.widgetMgr.setStringValue).toHaveBeenLastCalledWith(
+      props.element.id,
+      newColor,
+      { formId: props.element.formId, fragmentId: undefined, fromUser: true }
+    )
+
+    act(() => {
+      // "Submit" the form
+      props.widgetMgr.submitForm("form", undefined)
+    })
+
+    // Our widget should be reset, and the widgetMgr should be updated
+    expect(colorBlock).toHaveStyle("background-color: #000000")
+    expect(props.widgetMgr.setStringValue).toHaveBeenLastCalledWith(
+      props.element.id,
+      props.element.default,
+      { formId: props.element.formId, fragmentId: undefined, fromUser: true }
+    )
+  })
+})
+
+describe("ColorPicker query param binding", () => {
+  it("registers query param binding on mount when queryParamKey is set", () => {
+    const props = getProps({ queryParamKey: "my_color" })
+    vi.spyOn(props.widgetMgr, "registerQueryParamBinding")
+
+    render(<ColorPicker {...props} />)
+
+    expect(props.widgetMgr.registerQueryParamBinding).toHaveBeenCalledWith(
+      props.element.id,
+      "my_color",
+      "string_value",
+      props.element.default,
+      false,
+      undefined
+    )
+  })
+
+  it("unregisters query param binding on unmount", () => {
+    const props = getProps({ queryParamKey: "my_color" })
+    const unregisterSpy = vi.spyOn(
+      props.widgetMgr,
+      "unregisterQueryParamBinding"
+    )
+
+    const { unmount } = render(<ColorPicker {...props} />)
+
+    // Clear any calls from React Strict Mode's initial mount/unmount/remount cycle
+    unregisterSpy.mockClear()
+
+    unmount()
+
+    expect(props.widgetMgr.unregisterQueryParamBinding).toHaveBeenCalledWith(
+      props.element.id
+    )
+  })
+
+  it("does not register query param binding when queryParamKey is not set", () => {
+    const props = getProps()
+    vi.spyOn(props.widgetMgr, "registerQueryParamBinding")
+
+    render(<ColorPicker {...props} />)
+
+    expect(props.widgetMgr.registerQueryParamBinding).not.toHaveBeenCalled()
+  })
+
+  it("registers query param binding with custom default color", () => {
+    const props = getProps({
+      queryParamKey: "theme_color",
+      default: "#750dc5",
+    })
+    vi.spyOn(props.widgetMgr, "registerQueryParamBinding")
+
+    render(<ColorPicker {...props} />)
+
+    expect(props.widgetMgr.registerQueryParamBinding).toHaveBeenCalledWith(
+      props.element.id,
+      "theme_color",
+      "string_value",
+      "#750dc5",
+      false,
+      undefined
+    )
+
+    // Verify the widget displays the custom default color
+    const colorBlock = screen.getByTestId("stColorPickerBlock")
+    expect(colorBlock).toHaveStyle("background-color: #750dc5")
+  })
+})
+
+describe("on_change='ignore' mode", () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  // Wait for WidgetStateManager's macrotask flush so a missed rerun would still be observed.
+  async function flushScheduledRerun(): Promise<void> {
+    await act(async () => {
+      await new Promise(resolve => {
+        setTimeout(resolve, 0)
+      })
+    })
+  }
+
+  async function commitHexViaClose(
+    user: ReturnType<typeof userEvent.setup>,
+    newColor: string,
+    closeWith: "swatch" | "escape" = "swatch"
+  ): Promise<void> {
+    const colorBlock = screen.getByTestId("stColorPickerBlock")
+    await user.click(colorBlock)
+    const colorInput = screen.getByRole("textbox")
+    await user.tripleClick(colorInput)
+    await user.keyboard("{backspace}")
+    await user.type(colorInput, newColor)
+    if (closeWith === "escape") {
+      await user.keyboard("{Escape}")
+    } else {
+      await user.click(colorBlock)
+    }
+  }
+
+  it("passes triggerRerun: false when ignoreRerun is true", async () => {
+    const user = userEvent.setup()
+    const sendRerunBackMsg = vi.fn()
+    const widgetMgr = new WidgetStateManager({
+      sendRerunBackMsg,
+      formsDataChanged: vi.fn(),
+    })
+    const props = getProps({ ignoreRerun: true }, { widgetMgr })
+    const setStringValueSpy = vi.spyOn(props.widgetMgr, "setStringValue")
+
+    render(<ColorPicker {...props} />)
+    setStringValueSpy.mockClear()
+    sendRerunBackMsg.mockClear()
+
+    await commitHexViaClose(user, "#e91e63", "escape")
+
+    expect(setStringValueSpy).toHaveBeenLastCalledWith(
+      props.element.id,
+      "#e91e63",
+      {
+        formId: props.element.formId,
+        fragmentId: undefined,
+        fromUser: true,
+        triggerRerun: false,
+      }
+    )
+    await flushScheduledRerun()
+    expect(sendRerunBackMsg).not.toHaveBeenCalled()
+  })
+
+  it("does not pass triggerRerun when ignoreRerun is false", async () => {
+    const user = userEvent.setup()
+    const sendRerunBackMsg = vi.fn()
+    const widgetMgr = new WidgetStateManager({
+      sendRerunBackMsg,
+      formsDataChanged: vi.fn(),
+    })
+    const props = getProps({ ignoreRerun: false }, { widgetMgr })
+    const setStringValueSpy = vi.spyOn(props.widgetMgr, "setStringValue")
+
+    render(<ColorPicker {...props} />)
+    setStringValueSpy.mockClear()
+    sendRerunBackMsg.mockClear()
+
+    await commitHexViaClose(user, "#e91e63")
+
+    expect(setStringValueSpy).toHaveBeenLastCalledWith(
+      props.element.id,
+      "#e91e63",
+      {
+        formId: props.element.formId,
+        fragmentId: undefined,
+        fromUser: true,
+      }
+    )
+    await flushScheduledRerun()
+    expect(sendRerunBackMsg).toHaveBeenCalled()
+  })
+
+  it("does not change form batching when ignoreRerun is true", async () => {
+    const user = userEvent.setup()
+    const sendRerunBackMsg = vi.fn()
+    let pendingFormIds = new Set<string>()
+    const widgetMgr = new WidgetStateManager({
+      sendRerunBackMsg,
+      formsDataChanged: vi.fn(newData => {
+        pendingFormIds = newData.formsWithPendingChanges
+      }),
+    })
+    const props = getProps(
+      {
+        ignoreRerun: true,
+        formId: "testForm",
+      },
+      { widgetMgr }
+    )
+    const setStringValueSpy = vi.spyOn(props.widgetMgr, "setStringValue")
+
+    render(<ColorPicker {...props} />)
+    setStringValueSpy.mockClear()
+    sendRerunBackMsg.mockClear()
+
+    await commitHexViaClose(user, "#e91e63")
+
+    expect(setStringValueSpy).toHaveBeenLastCalledWith(
+      props.element.id,
+      "#e91e63",
+      {
+        formId: "testForm",
+        fragmentId: undefined,
+        fromUser: true,
+        triggerRerun: false,
+      }
+    )
+    await flushScheduledRerun()
+    expect(sendRerunBackMsg).not.toHaveBeenCalled()
+    expect(pendingFormIds).toEqual(new Set(["testForm"]))
+  })
+
+  it("does not commit while typing with the popover open", async () => {
+    const user = userEvent.setup()
+    const props = getProps({ ignoreRerun: true })
+    const setStringValueSpy = vi.spyOn(props.widgetMgr, "setStringValue")
+
+    render(<ColorPicker {...props} />)
+    setStringValueSpy.mockClear()
+
+    const colorBlock = screen.getByTestId("stColorPickerBlock")
+    await user.click(colorBlock)
+    const colorInput = screen.getByRole("textbox")
+    await user.tripleClick(colorInput)
+    await user.keyboard("{backspace}")
+    await user.type(colorInput, "#e91e63")
+
+    // Popover still open — typing is local preview only.
+    expect(setStringValueSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe("ColorPicker no-op interactions", () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  async function flushScheduledRerun(): Promise<void> {
+    await act(async () => {
+      await new Promise(resolve => {
+        setTimeout(resolve, 0)
+      })
+    })
+  }
+
+  function renderWithRerunSpy(elementProps: Partial<ColorPickerProto> = {}): {
+    sendRerunBackMsg: ReturnType<typeof vi.fn>
+    setStringValueSpy: ReturnType<typeof vi.spyOn>
+  } {
+    const sendRerunBackMsg = vi.fn()
+    const widgetMgr = new WidgetStateManager({
+      sendRerunBackMsg,
+      formsDataChanged: vi.fn(),
+    })
+    const props = getProps(elementProps, { widgetMgr })
+    const setStringValueSpy = vi.spyOn(widgetMgr, "setStringValue")
+    render(
+      <div>
+        <span>outside</span>
+        <ColorPicker {...props} />
+      </div>
+    )
+    setStringValueSpy.mockClear()
+    sendRerunBackMsg.mockClear()
+    return { sendRerunBackMsg, setStringValueSpy }
+  }
+
+  it.each(["swatch", "escape", "outside"] as const)(
+    "does not commit or rerun when closed via %s without a change",
+    async closeWith => {
+      const user = userEvent.setup()
+      const { sendRerunBackMsg, setStringValueSpy } = renderWithRerunSpy()
+
+      const colorBlock = screen.getByTestId("stColorPickerBlock")
+      await user.click(colorBlock)
+      expect(screen.getByTestId("stColorPickerPopover")).toBeVisible()
+
+      if (closeWith === "escape") {
+        await user.keyboard("{Escape}")
+      } else if (closeWith === "outside") {
+        // Advance Date.now() past the 50ms guard that keeps the opening click
+        // from also closing the popover.
+        vi.spyOn(Date, "now").mockReturnValue(Date.now() + 100)
+        await user.click(screen.getByText("outside"))
+      } else {
+        await user.click(colorBlock)
+      }
+      await flushScheduledRerun()
+
+      expect(
+        screen.queryByTestId("stColorPickerPopover")
+      ).not.toBeInTheDocument()
+      expect(setStringValueSpy).not.toHaveBeenCalled()
+      expect(sendRerunBackMsg).not.toHaveBeenCalled()
+    }
+  )
+
+  it("treats a hex value differing only in case as unchanged", async () => {
+    const user = userEvent.setup()
+    const { sendRerunBackMsg, setStringValueSpy } = renderWithRerunSpy({
+      default: "#E91E63",
+    })
+
+    const colorBlock = screen.getByTestId("stColorPickerBlock")
+    await user.click(colorBlock)
+    const colorInput = screen.getByRole("textbox")
+    await user.tripleClick(colorInput)
+    await user.keyboard("{backspace}")
+    await user.type(colorInput, "#e91e63")
+    await user.click(colorBlock)
+    await flushScheduledRerun()
+
+    expect(setStringValueSpy).not.toHaveBeenCalled()
+    expect(sendRerunBackMsg).not.toHaveBeenCalled()
+  })
+
+  it("still commits and reruns when the color changes", async () => {
+    const user = userEvent.setup()
+    const { sendRerunBackMsg, setStringValueSpy } = renderWithRerunSpy()
+
+    const colorBlock = screen.getByTestId("stColorPickerBlock")
+    await user.click(colorBlock)
+    const colorInput = screen.getByRole("textbox")
+    await user.tripleClick(colorInput)
+    await user.keyboard("{backspace}")
+    await user.type(colorInput, "#e91e63")
+    await user.keyboard("{Escape}")
+    await flushScheduledRerun()
+
+    expect(setStringValueSpy).toHaveBeenCalledExactlyOnceWith(
+      "1",
+      "#e91e63",
+      expect.objectContaining({ fromUser: true })
+    )
+    expect(sendRerunBackMsg).toHaveBeenCalledOnce()
+  })
+})

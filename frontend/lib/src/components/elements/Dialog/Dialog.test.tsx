@@ -1,0 +1,519 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { screen } from "@testing-library/react"
+import { userEvent } from "@testing-library/user-event"
+import { vi } from "vitest"
+
+import { Block as BlockProto } from "@streamlit/protobuf"
+
+import { render } from "~lib/test_util"
+import { WidgetStateManager } from "~lib/WidgetStateManager"
+
+import Dialog, { type Props as DialogProps } from "./Dialog"
+
+const getProps = (
+  elementProps: Partial<BlockProto.Dialog> = {},
+  props: Partial<DialogProps> = {}
+): DialogProps => ({
+  element: BlockProto.Dialog.create({
+    title: "StreamlitDialog",
+    isOpen: true,
+    dismissible: true,
+    ...elementProps,
+  }),
+  widgetMgr: new WidgetStateManager({
+    sendRerunBackMsg: vi.fn(),
+    formsDataChanged: vi.fn(),
+  }),
+  fragmentId: undefined,
+  ...props,
+})
+
+describe("Dialog container", () => {
+  it("renders without crashing", () => {
+    const props = getProps()
+    render(
+      <Dialog {...props}>
+        <div>test</div>
+      </Dialog>
+    )
+
+    const dialogContainer = screen.getByTestId("stDialog")
+    expect(dialogContainer).toBeInTheDocument()
+    expect(dialogContainer).toHaveClass("stDialog")
+  })
+
+  it("should render the text when open", () => {
+    const props = getProps()
+    render(
+      <Dialog {...props}>
+        <div>test</div>
+      </Dialog>
+    )
+
+    expect(screen.getByText("test")).toBeVisible()
+  })
+
+  it("should not render the text when closed", () => {
+    const props = getProps({ isOpen: false })
+    render(
+      <Dialog {...props}>
+        <div>test</div>
+      </Dialog>
+    )
+
+    expect(screen.queryByText("test")).not.toBeInTheDocument()
+  })
+
+  it("renders an icon when provided", () => {
+    const props = getProps({ icon: "🎉" })
+    render(
+      <Dialog {...props}>
+        <div>test</div>
+      </Dialog>
+    )
+
+    const icon = screen.getByTestId("stDialogIcon")
+    expect(icon).toBeVisible()
+    expect(icon).toHaveTextContent("🎉")
+  })
+
+  it("does not render an icon when not provided", () => {
+    const props = getProps()
+    render(
+      <Dialog {...props}>
+        <div>test</div>
+      </Dialog>
+    )
+
+    expect(screen.queryByTestId("stDialogIcon")).not.toBeInTheDocument()
+  })
+
+  it("should close when dismissible", async () => {
+    const user = userEvent.setup()
+    const props = getProps()
+    render(
+      <Dialog {...props}>
+        <div>test</div>
+      </Dialog>
+    )
+
+    expect(screen.getByText("test")).toBeVisible()
+    await user.click(screen.getByLabelText("Close"))
+    // Close dismisses the dialog, so the content should unmount
+    expect(screen.queryByText("test")).not.toBeInTheDocument()
+  })
+
+  it("should not close when not dismissible", () => {
+    const props = getProps({ dismissible: false })
+    render(
+      <Dialog {...props}>
+        <div>test</div>
+      </Dialog>
+    )
+
+    expect(screen.getByText("test")).toBeVisible()
+    // close button - and hence dismiss - does not exist
+    expect(screen.queryByLabelText("Close")).not.toBeInTheDocument()
+  })
+
+  it("should handle modal close events when dismissible", async () => {
+    const user = userEvent.setup()
+    const props = getProps({ dismissible: true })
+    render(
+      <Dialog {...props}>
+        <div>test content</div>
+      </Dialog>
+    )
+
+    expect(screen.getByText("test content")).toBeVisible()
+
+    // Click the close button to trigger onClose
+    const closeButton = screen.getByLabelText("Close")
+    await user.click(closeButton)
+
+    // Dialog should be closed (content no longer visible)
+    expect(screen.queryByText("test content")).not.toBeInTheDocument()
+  })
+
+  describe("on_dismiss functionality", () => {
+    it("does not trigger rerun when id is not set", async () => {
+      const user = userEvent.setup()
+      const mockWidgetMgr = {
+        setTriggerValue: vi.fn(),
+      }
+
+      const props = getProps(
+        {
+          id: "", // No id means on_dismiss="ignore"
+          dismissible: true,
+        },
+        {
+          widgetMgr: mockWidgetMgr as unknown as WidgetStateManager,
+        }
+      )
+
+      render(
+        <Dialog {...props}>
+          <div>test content</div>
+        </Dialog>
+      )
+
+      // Simulate dismiss action
+      const closeButton = screen.getByLabelText("Close")
+      await user.click(closeButton)
+
+      expect(mockWidgetMgr.setTriggerValue).not.toHaveBeenCalled()
+    })
+
+    it("triggers rerun when id is set", async () => {
+      const user = userEvent.setup()
+      const mockWidgetMgr = {
+        setTriggerValue: vi.fn().mockResolvedValue(undefined),
+      }
+
+      const props = getProps(
+        {
+          id: "test-dialog-id", // id present means on_dismiss is activated
+          dismissible: true,
+        },
+        {
+          widgetMgr: mockWidgetMgr as unknown as WidgetStateManager,
+          fragmentId: "test-fragment-id",
+        }
+      )
+
+      render(
+        <Dialog {...props}>
+          <div>test content</div>
+        </Dialog>
+      )
+
+      // Simulate dismiss action
+      const closeButton = screen.getByLabelText("Close")
+      await user.click(closeButton)
+
+      expect(mockWidgetMgr.setTriggerValue).toHaveBeenCalledWith(
+        "test-dialog-id",
+        { formId: "", fragmentId: "test-fragment-id", fromUser: true }
+      )
+    })
+
+    it("triggers rerun without fragmentId when not provided", async () => {
+      const user = userEvent.setup()
+      const mockWidgetMgr = {
+        setTriggerValue: vi.fn().mockResolvedValue(undefined),
+      }
+
+      const props = getProps(
+        {
+          id: "test-dialog-id",
+          dismissible: true,
+        },
+        {
+          widgetMgr: mockWidgetMgr as unknown as WidgetStateManager,
+          // fragmentId not provided
+        }
+      )
+
+      render(
+        <Dialog {...props}>
+          <div>test content</div>
+        </Dialog>
+      )
+
+      // Simulate dismiss action
+      const closeButton = screen.getByLabelText("Close")
+      await user.click(closeButton)
+
+      expect(mockWidgetMgr.setTriggerValue).toHaveBeenCalledWith(
+        "test-dialog-id",
+        { formId: "", fragmentId: undefined, fromUser: true }
+      )
+    })
+
+    it("does not trigger rerun when dialog is non-dismissible", () => {
+      const mockWidgetMgr = {
+        setTriggerValue: vi.fn(),
+      }
+
+      const props = getProps(
+        {
+          id: "test-dialog-id",
+          dismissible: false, // Non-dismissible dialog
+        },
+        {
+          widgetMgr: mockWidgetMgr as unknown as WidgetStateManager,
+        }
+      )
+
+      render(
+        <Dialog {...props}>
+          <div>test content</div>
+        </Dialog>
+      )
+
+      // No close button should exist, so no way to trigger dismiss event
+      expect(screen.queryByLabelText("Close")).not.toBeInTheDocument()
+      expect(mockWidgetMgr.setTriggerValue).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("dialog width", () => {
+    // The mapDialogWidthToModalSize function is tested implicitly here.
+    // The Modal component's calculateModalSize is tested separately in Modal.test.tsx.
+    // Here we verify that different width props render the dialog correctly.
+    it.each([
+      { width: BlockProto.Dialog.DialogWidth.SMALL, expectedSize: "default" },
+      { width: BlockProto.Dialog.DialogWidth.MEDIUM, expectedSize: "medium" },
+      { width: BlockProto.Dialog.DialogWidth.LARGE, expectedSize: "large" },
+    ])(
+      "renders dialog with $expectedSize size when width is $width",
+      ({ width }) => {
+        const props = getProps({ width })
+        render(
+          <Dialog {...props}>
+            <div>test</div>
+          </Dialog>
+        )
+
+        // Verify the dialog renders successfully with the given width prop
+        const modal = screen.getByRole("dialog")
+        expect(modal).toBeVisible()
+
+        // Verify dialog content is rendered
+        expect(screen.getByText("test")).toBeVisible()
+      }
+    )
+
+    it("uses an explicit pixel width instead of the enum preset", () => {
+      const props = getProps({
+        width: BlockProto.Dialog.DialogWidth.LARGE,
+        pixelWidth: 400,
+      })
+      render(
+        <Dialog {...props}>
+          <div>test</div>
+        </Dialog>
+      )
+
+      const panel = document.querySelector("[role='dialog']")?.parentElement
+      // 400 / default baseFontSize 16 = 25rem, not the large preset (80rem).
+      expect(panel).toHaveStyle({ width: "25rem" })
+      expect(panel).not.toHaveStyle({ width: "80rem" })
+      expect(screen.getByText("test")).toBeVisible()
+    })
+
+    it.each([
+      { label: "omitted", pixelWidth: undefined },
+      { label: "null", pixelWidth: null },
+      { label: "zero", pixelWidth: 0 },
+    ])("uses the large preset when pixelWidth is $label", ({ pixelWidth }) => {
+      const props = getProps({
+        width: BlockProto.Dialog.DialogWidth.LARGE,
+      })
+      if (pixelWidth === undefined) {
+        // protobufjs keeps proto3 defaults on the prototype, so delete is a no-op.
+        Object.defineProperty(props.element, "pixelWidth", {
+          value: undefined,
+        })
+      } else {
+        props.element.pixelWidth = pixelWidth
+      }
+
+      render(
+        <Dialog {...props}>
+          <div>test</div>
+        </Dialog>
+      )
+
+      const panel = document.querySelector("[role='dialog']")?.parentElement
+      expect(panel).toHaveStyle({ width: "80rem" })
+      expect(panel).not.toHaveStyle({ width: "0rem" })
+      expect(screen.getByText("test")).toBeVisible()
+    })
+  })
+
+  describe("dialog position", () => {
+    it("renders a centered dialog when position is omitted", () => {
+      const props = getProps()
+      // Simulate a payload that never set the enum. protobufjs keeps the
+      // proto3 default on the prototype, so `delete` would be a no-op.
+      Object.defineProperty(props.element, "position", { value: undefined })
+      render(
+        <Dialog {...props}>
+          <div>test</div>
+        </Dialog>
+      )
+
+      expect(screen.getByTestId("stDialog")).toHaveStyle({
+        justifyContent: "center",
+      })
+      expect(screen.getByText("test")).toBeVisible()
+    })
+
+    it.each([
+      {
+        position: BlockProto.Dialog.DialogPosition.CENTER,
+        justifyContent: "center",
+      },
+      {
+        position: BlockProto.Dialog.DialogPosition.LEFT,
+        justifyContent: "flex-start",
+      },
+      {
+        position: BlockProto.Dialog.DialogPosition.RIGHT,
+        justifyContent: "flex-end",
+      },
+    ])(
+      "places a $position dialog with overlay justifyContent $justifyContent",
+      ({ position, justifyContent }) => {
+        const props = getProps({ position })
+        render(
+          <Dialog {...props}>
+            <div>test</div>
+          </Dialog>
+        )
+
+        expect(screen.getByTestId("stDialog")).toHaveStyle({ justifyContent })
+        expect(screen.getByText("test")).toBeVisible()
+      }
+    )
+  })
+
+  describe("keyboard handling", () => {
+    it("prevents R keydown from triggering rerun when dialog is non-dismissible", () => {
+      const props = getProps({ dismissible: false })
+
+      render(
+        <Dialog {...props}>
+          <div>test content</div>
+        </Dialog>
+      )
+
+      // Capture-phase keydown suppresses R so the app-level shortcut cannot
+      // rerun (and close) a non-dismissible dialog.
+      const event = new KeyboardEvent("keydown", {
+        key: "r",
+        bubbles: true,
+        cancelable: true,
+      })
+      const stopImmediateSpy = vi.spyOn(event, "stopImmediatePropagation")
+
+      const wasDefaultPrevented = !document.dispatchEvent(event)
+
+      expect(wasDefaultPrevented).toBe(true)
+      expect(stopImmediateSpy).toHaveBeenCalled()
+      expect(screen.getByText("test content")).toBeVisible()
+    })
+
+    it("does not prevent R key when dialog is dismissible", () => {
+      const props = getProps({ dismissible: true })
+
+      render(
+        <Dialog {...props}>
+          <div>test content</div>
+        </Dialog>
+      )
+
+      // Dispatch a keyboard event for 'r' key
+      const event = new KeyboardEvent("keydown", {
+        key: "r",
+        bubbles: true,
+        cancelable: true,
+      })
+
+      const wasDefaultPrevented = !document.dispatchEvent(event)
+
+      // For dismissible dialogs, the R key should NOT be prevented
+      expect(wasDefaultPrevented).toBe(false)
+    })
+
+    it("allows typing in input fields within non-dismissible dialogs", async () => {
+      const user = userEvent.setup()
+      const props = getProps({ dismissible: false })
+      render(
+        <Dialog {...props}>
+          <input type="text" aria-label="Test input" />
+        </Dialog>
+      )
+
+      const input = screen.getByLabelText("Test input")
+      await user.click(input)
+      await user.type(input, "test")
+
+      expect(input).toHaveValue("test")
+    })
+
+    it("ignores keydown events without a string key when dialog is non-dismissible", () => {
+      const props = getProps({ dismissible: false })
+      render(
+        <Dialog {...props}>
+          <div>test content</div>
+        </Dialog>
+      )
+      expect(screen.getByText("test content")).toBeVisible()
+
+      const event = new Event("keydown", { bubbles: true, cancelable: true })
+      const stopImmediateSpy = vi.spyOn(event, "stopImmediatePropagation")
+      const preventDefaultSpy = vi.spyOn(event, "preventDefault")
+
+      const listenerErrors: unknown[] = []
+      const onError = (errorEvent: ErrorEvent): void => {
+        listenerErrors.push(errorEvent.error)
+        errorEvent.preventDefault()
+      }
+      // jsdom reports throwing listeners as window `error` events instead of
+      // throwing from `dispatchEvent`.
+      window.addEventListener("error", onError)
+      try {
+        document.dispatchEvent(event)
+      } finally {
+        window.removeEventListener("error", onError)
+      }
+
+      expect(listenerErrors).toEqual([])
+      expect(preventDefaultSpy).not.toHaveBeenCalled()
+      expect(stopImmediateSpy).not.toHaveBeenCalled()
+    })
+
+    it("does not intercept R keydown from a select in a non-dismissible dialog", () => {
+      const props = getProps({ dismissible: false })
+      render(
+        <Dialog {...props}>
+          <select aria-label="Test select">
+            <option value="r">r</option>
+          </select>
+        </Dialog>
+      )
+
+      // Dispatch on the select so event.target is SELECT and the allow-typing path runs.
+      const target = screen.getByLabelText("Test select")
+      const event = new KeyboardEvent("keydown", {
+        key: "r",
+        bubbles: true,
+        cancelable: true,
+      })
+      const stopImmediateSpy = vi.spyOn(event, "stopImmediatePropagation")
+
+      const wasDefaultPrevented = !target.dispatchEvent(event)
+
+      expect(wasDefaultPrevented).toBe(false)
+      expect(stopImmediateSpy).not.toHaveBeenCalled()
+    })
+  })
+})

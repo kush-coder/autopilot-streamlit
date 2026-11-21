@@ -1,0 +1,376 @@
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import re
+
+from playwright.sync_api import Locator, Page, expect
+
+from e2e_playwright.conftest import (
+    ImageCompareFunction,
+    build_app_url,
+    wait_for_app_loaded,
+    wait_for_app_run,
+)
+from e2e_playwright.shared.app_utils import (
+    check_top_level_class,
+    click_button,
+    click_checkbox,
+    click_form_button,
+    click_toggle,
+    expect_markdown,
+    expect_prefixed_markdown,
+    get_element_by_key,
+    get_feedback,
+    get_markdown,
+)
+
+
+def get_feedback_icon_buttons(locator: Locator, type: str | None = None) -> Locator:
+    elements = locator.get_by_test_id(re.compile(r"stFeedbackButton(Active)?"))
+    if type:
+        elements = elements.filter(has_text=type)
+    return elements
+
+
+def get_feedback_icon_button(
+    locator: Locator, type: str | None = None, index: int = 0
+) -> Locator:
+    return get_feedback_icon_buttons(locator, type).nth(index)
+
+
+def test_click_thumbsup_and_take_snapshot(
+    themed_app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Create snapshot of thumbs feedback (enabled & disabled)."""
+
+    container = get_element_by_key(themed_app, "thumbs_container")
+    expect(container).to_be_attached()
+
+    thumbs = get_feedback(themed_app, "thumbs_container")
+    expect(thumbs).to_be_attached()
+    get_feedback_icon_button(thumbs, "thumb_up").click()
+    wait_for_app_run(themed_app)
+
+    # Hover over the hover test feedback to show hover state
+    hover_test_button = get_feedback_icon_button(
+        get_feedback(themed_app, "thumbs_feedback_hover_test"), "thumb_down"
+    )
+    hover_test_button.hover()
+
+    assert_snapshot(container, name="st_feedback-thumbs")
+
+
+def test_clicking_on_faces_shows_sentiment_via_on_change_callback_and_take_snapshot(
+    themed_app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Create snapshot of faces feedback (enabled & disabled)."""
+
+    container = get_element_by_key(themed_app, "faces_container")
+    expect(container).to_be_attached()
+
+    faces = get_feedback(themed_app, "faces_container")
+    get_feedback_icon_button(faces, "sentiment_satisfied").click()
+    wait_for_app_run(themed_app)
+    text = get_markdown(themed_app, "Faces sentiment: 3")
+    expect(text).to_be_attached()
+
+    # Hover over the hover test feedback to show hover state
+    hover_test_button = get_feedback_icon_button(
+        get_feedback(themed_app, "faces_feedback_hover_test"),
+        "sentiment_very_satisfied",
+    )
+    hover_test_button.hover()
+
+    assert_snapshot(container, name="st_feedback-faces")
+
+
+def test_clicking_on_stars_shows_sentiment_and_take_snapshot(
+    themed_app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Create snapshot of stars feedback (enabled & disabled)."""
+
+    container = get_element_by_key(themed_app, "stars_container")
+    expect(container).to_be_attached()
+
+    stars = get_feedback(themed_app, "stars_container")
+    get_feedback_icon_button(stars, "star", 3).click()
+    wait_for_app_run(themed_app)
+    text = get_markdown(themed_app, "Star sentiment: 3")
+    expect(text).to_be_attached()
+
+    # Hover over the hover test feedback to show hover state
+    hover_test_button = get_feedback_icon_button(
+        get_feedback(themed_app, "stars_feedback_hover_test"), "star", 4
+    )
+    hover_test_button.hover()
+
+    assert_snapshot(container, name="st_feedback-stars")
+
+
+def test_feedback_buttons_are_disabled(app: Page):
+    """Test that feedback buttons are disabled when `disabled=True` and that
+    they cannot be interacted with.
+    """
+
+    container = get_element_by_key(app, "stars_container")
+    expect(container).to_be_attached()
+
+    stars = get_feedback(app, "star_feedback_disabled")
+    star_buttons = get_feedback_icon_buttons(stars)
+    for star_button in star_buttons.all():
+        expect(star_button).to_have_js_property("disabled", True)
+    selected_button = star_buttons.nth(4)
+    selected_button.click(force=True)
+    expect(selected_button).not_to_have_css(
+        "color", re.compile(r"rgb\(\d+, \d+, \d+\)")
+    )
+    # the feedback value was set to 3 via session state
+    text = get_markdown(app, "feedback-disabled: 3")
+    expect(text).to_be_attached()
+
+
+def test_pass_default_selections(app: Page):
+    """Test that passed defaults are rendered correctly."""
+    expect_markdown(app, "Star sentiment: None")
+
+    click_checkbox(app, "Set default value")
+    expect_markdown(app, "Star sentiment: 2")
+
+    click_checkbox(app, "Set default value")
+    expect_markdown(app, "Star sentiment: None")
+
+
+def test_feedback_works_in_forms(app: Page):
+    expect(app.get_by_text("feedback-in-form: None")).to_be_visible()
+
+    container = app.get_by_test_id("stForm")
+    expect(container).to_be_attached()
+
+    thumbs = get_feedback(app, "feedback_in_form")
+    get_feedback_icon_button(thumbs, "thumb_up").click()
+    expect(app.get_by_text("feedback-in-form: None")).to_be_visible()
+    click_form_button(app, "Submit")
+    wait_for_app_run(app)
+
+    text = get_markdown(app, "feedback-in-form: 1")
+    expect(text).to_be_attached()
+
+
+def test_feedback_works_with_fragments(app: Page):
+    expect(app.get_by_text("Runs: 1")).to_be_visible()
+    expect(app.get_by_text("feedback-in-fragment: None")).to_be_visible()
+
+    thumbs = get_feedback(app, "fragment_feedback")
+    get_feedback_icon_button(thumbs, "thumb_up").click()
+    wait_for_app_run(app)
+
+    expect(app.get_by_text("feedback-in-fragment: 1")).to_be_visible()
+    expect(app.get_by_text("Runs: 1")).to_be_visible()
+
+
+def test_feedback_remount_keep_value(app: Page):
+    """Test that `st.feedback` remounts correctly without resetting value."""
+
+    expect(app.get_by_text("feedback-after-sleep: None")).to_be_visible()
+
+    thumbs = get_feedback(app, "after_sleep_feedback")
+    selected_button = get_feedback_icon_button(thumbs, "thumb_up")
+    selected_button.click()
+    wait_for_app_run(app)
+    expect(app.get_by_text("feedback-after-sleep: 1")).to_be_visible()
+    expect(selected_button).to_have_css("color", re.compile(r"rgb\(\d+, \d+, \d+\)"))
+    click_button(app, "Create some elements to unmount component")
+    expect(selected_button).to_have_css("color", re.compile(r"rgb\(\d+, \d+, \d+\)"))
+    expect(app.get_by_text("feedback-after-sleep: 1")).to_be_visible()
+
+
+def test_check_top_level_class(app: Page):
+    """Check that the top level class is correctly set."""
+
+    check_top_level_class(app, "stFeedback")
+
+
+def test_custom_css_class_via_key(app: Page):
+    """Test that the element can have a custom css class via the key argument."""
+
+    expect(get_element_by_key(app, "faces_feedback")).to_be_visible()
+
+
+def test_feedback_width_examples(app: Page, assert_snapshot: ImageCompareFunction):
+    """Test feedback widgets with different width configurations."""
+
+    # Test thumbs width examples
+    thumbs_content = get_element_by_key(app, "thumbs_content_width")
+    assert_snapshot(thumbs_content, name="st_feedback-thumbs_width_content")
+
+    thumbs_stretch = get_element_by_key(app, "thumbs_stretch_width")
+    assert_snapshot(thumbs_stretch, name="st_feedback-thumbs_width_stretch")
+
+    thumbs_300px = get_element_by_key(app, "thumbs_300px_width")
+    assert_snapshot(thumbs_300px, name="st_feedback-thumbs_width_300px")
+
+
+def test_feedback_minimum_width_enforcement(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Test that st.feedback enforces minimum width to prevent icon wrapping (gh-12068)."""
+    min_width_container = get_element_by_key(app, "feedback_min_width")
+    assert_snapshot(min_width_container, name="st_feedback-min_width_enforced")
+
+
+def test_dynamic_feedback_props(app: Page, assert_snapshot: ImageCompareFunction):
+    """Test that the feedback can be updated dynamically while keeping the state."""
+    feedback_widget = get_feedback(app, "dynamic_feedback_widget")
+    expect(feedback_widget).to_be_visible()
+
+    # Initial state
+    assert_snapshot(feedback_widget, name="st_feedback-dynamic_initial")
+    expect_prefixed_markdown(app, "Initial feedback value:", "2")
+
+    # Click to change selection
+    get_feedback_icon_button(feedback_widget, None, 3).click()
+
+    wait_for_app_run(app)
+    expect_prefixed_markdown(app, "Initial feedback value:", "3")
+
+    # Update props via toggle
+    click_toggle(app, "Update feedback props")
+
+    # Value persisted
+    expect_prefixed_markdown(app, "Updated feedback value:", "3")
+
+    feedback_widget.scroll_into_view_if_needed()
+    assert_snapshot(feedback_widget, name="st_feedback-dynamic_updated")
+
+    # Click a different value
+    get_feedback_icon_button(feedback_widget, None, 4).click()
+
+    wait_for_app_run(app)
+    expect_prefixed_markdown(app, "Updated feedback value:", "4")
+
+
+def test_feedback_on_change_ignore(app: Page):
+    """Test that on_change='ignore' suppresses the rerun and sends the buffered
+    value on the next rerun.
+    """
+    expect(app.get_by_text("Runs: 1", exact=True)).to_be_visible()
+    expect_prefixed_markdown(app, "Ignore feedback value:", "None")
+
+    ignore_feedback = get_feedback(app, "ignore_feedback")
+    selected_button = get_feedback_icon_button(ignore_feedback, "thumb_up")
+    selected_button.click()
+
+    # Catch a delayed rerun that the click might still schedule.
+    wait_for_app_run(app)
+
+    expect(app.get_by_text("Runs: 1", exact=True)).to_be_visible()
+    expect(app.get_by_text("Runs: 2", exact=True)).not_to_be_visible()
+    expect(selected_button).to_have_attribute("aria-checked", "true")
+    expect_prefixed_markdown(app, "Ignore feedback value:", "None")
+
+    app.get_by_role("button", name="Apply ignore feedback", exact=True).click()
+    wait_for_app_run(app)
+
+    expect(app.get_by_text("Runs: 2", exact=True)).to_be_visible()
+    expect(app.get_by_text("Ignore feedback value: 1", exact=True)).to_be_visible()
+    expect(
+        app.get_by_text("Applied ignore feedback value: 1", exact=True)
+    ).to_be_visible()
+
+
+def test_feedback_on_change_ignore_clearing_default(app: Page):
+    """Test that clearing a defaulted rating in ignore mode buffers None.
+
+    The empty-string wire value must survive until the next rerun and must not
+    fall back to the non-null default.
+    """
+    expect(app.get_by_text("Runs: 1", exact=True)).to_be_visible()
+    expect_prefixed_markdown(app, "Ignore default feedback value:", "1")
+
+    ignore_feedback = get_feedback(app, "ignore_feedback_default")
+    selected_button = get_feedback_icon_button(ignore_feedback, "thumb_up")
+    expect(selected_button).to_have_attribute("aria-checked", "true")
+    selected_button.click()
+
+    # Catch a delayed rerun that the click might still schedule.
+    wait_for_app_run(app)
+
+    expect(app.get_by_text("Runs: 1", exact=True)).to_be_visible()
+    expect(app.get_by_text("Runs: 2", exact=True)).not_to_be_visible()
+    expect(selected_button).to_have_attribute("aria-checked", "false")
+    expect_prefixed_markdown(app, "Ignore default feedback value:", "1")
+
+    app.get_by_role("button", name="Apply ignore default feedback", exact=True).click()
+    wait_for_app_run(app)
+
+    expect(app.get_by_text("Runs: 2", exact=True)).to_be_visible()
+    expect(
+        app.get_by_text("Ignore default feedback value: None", exact=True)
+    ).to_be_visible()
+    expect(
+        app.get_by_text("Applied ignore default feedback value: None", exact=True)
+    ).to_be_visible()
+
+
+def _bound_star(page: Page, index: int) -> Locator:
+    return get_feedback(page, "bound_rating").get_by_role(
+        "radio", name=f"{index + 1} out of 5 stars"
+    )
+
+
+def test_feedback_query_param_seeding(page: Page, app_base_url: str):
+    """Test that a bound feedback widget is seeded from the URL, and that an
+    invalid URL value falls back to the default and is removed.
+    """
+    page.goto(build_app_url(app_base_url, query={"bound_rating": "4"}))
+    wait_for_app_loaded(page)
+
+    expect_prefixed_markdown(page, "Bound feedback value:", "4")
+    expect(_bound_star(page, 4)).to_have_attribute("aria-checked", "true")
+    expect(page).to_have_url(re.compile(r"bound_rating=4"))
+
+    page.goto(build_app_url(app_base_url, query={"bound_rating": "9"}))
+    wait_for_app_loaded(page)
+
+    expect_prefixed_markdown(page, "Bound feedback value:", "2")
+    expect(_bound_star(page, 2)).to_have_attribute("aria-checked", "true")
+    expect(page).not_to_have_url(re.compile(r"bound_rating"))
+
+
+def test_feedback_query_param_updates_url(app: Page):
+    """Test that selecting, clearing, and reselecting the default rating of a
+    bound feedback widget updates the URL.
+    """
+    expect_prefixed_markdown(app, "Bound feedback value:", "2")
+    expect(app).not_to_have_url(re.compile(r"bound_rating"))
+
+    _bound_star(app, 0).click()
+    wait_for_app_run(app)
+    expect_prefixed_markdown(app, "Bound feedback value:", "0")
+    expect(app).to_have_url(re.compile(r"bound_rating=0"))
+
+    # Clicking the selected star clears the rating; the empty param keeps it
+    # cleared on reload instead of falling back to the default.
+    _bound_star(app, 0).click()
+    wait_for_app_run(app)
+    expect_prefixed_markdown(app, "Bound feedback value:", "None")
+    expect(app).to_have_url(re.compile(r"bound_rating=(&|$)"))
+
+    # Selecting the default removes the param.
+    _bound_star(app, 2).click()
+    wait_for_app_run(app)
+    expect_prefixed_markdown(app, "Bound feedback value:", "2")
+    expect(app).not_to_have_url(re.compile(r"bound_rating"))

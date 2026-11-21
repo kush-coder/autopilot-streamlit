@@ -1,0 +1,633 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import {
+  type FC,
+  memo,
+  type ReactElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react"
+
+import type * as Plotly from "plotly.js"
+
+import {
+  PlotlyChart as PlotlyChartProto,
+  type streamlit,
+} from "@streamlit/protobuf"
+import { isNullOrEmptyString } from "@streamlit/utils"
+
+import {
+  FlexContext,
+  hasStretchHeightFallback,
+} from "~lib/components/core/Layout/FlexContext"
+import {
+  shouldHeightStretch,
+  shouldWidthStretch,
+} from "~lib/components/core/Layout/utils"
+import { ElementFullscreenContext } from "~lib/components/shared/ElementFullscreen/ElementFullscreenContext"
+import withFullScreenWrapper from "~lib/components/shared/FullScreenWrapper/withFullScreenWrapper"
+import { FormClearHelper } from "~lib/components/widgets/Form/FormClearHelper"
+import { useCalculatedDimensions } from "~lib/hooks/useCalculatedDimensions"
+import { useEmotionTheme } from "~lib/hooks/useEmotionTheme"
+import { useRequiredContext } from "~lib/hooks/useRequiredContext"
+import useTimeout from "~lib/hooks/useTimeout"
+import Plot, {
+  type Figure as PlotlyFigureType,
+} from "~lib/util/reactPlotlyCompat"
+import type { WidgetStateManager } from "~lib/WidgetStateManager"
+
+import {
+  migratePlotlyMapboxConfig,
+  migratePlotlyMapboxFigure,
+} from "./mapboxCompat"
+import { StyledPlotlyChartContainer } from "./styled-components"
+import {
+  applyTheming,
+  handleClickEvent,
+  handleSelection,
+  sendEmptySelection,
+} from "./utils"
+
+// Minimum width for Plotly charts
+const MIN_WIDTH = 150
+
+/**
+ * The timeout duration (milliseconds) for resetting selection info within the plotly figure.
+ * This is required to ensure the reset executes after the onUpdate callback,
+ * preventing the selection state from being immediately overwritten due to plotly's update cycle.
+ */
+const RESET_SELECTION_TIMEOUT_MS = 50
+// Default height for Plotly charts when no height is specified.
+// Plotly.js replaces a layout height below this minimum with 450.
+const DEFAULT_PLOTLY_HEIGHT = 450
+const PLOTLY_MIN_LAYOUT_HEIGHT = 10
+
+/** Returns `height` when Plotly.js accepts it (>= 10); otherwise Plotly's 450px default. */
+const plotlyLayoutHeight = (height: number | undefined): number =>
+  height !== undefined && height >= PLOTLY_MIN_LAYOUT_HEIGHT
+    ? height
+    : DEFAULT_PLOTLY_HEIGHT
+
+// Custom icon used in the fullscreen expand toolbar button:
+/* eslint-disable streamlit-custom/no-hardcoded-theme-values */
+const FULLSCREEN_EXPAND_ICON = {
+  width: 600,
+  height: 470,
+  name: "fullscreen-expand",
+  // https://fontawesome.com/icons/expand?f=classic&s=solid
+  path: "M32 32C14.3 32 0 46.3 0 64v96c0 17.7 14.3 32 32 32s32-14.3 32-32V96h64c17.7 0 32-14.3 32-32s-14.3-32-32-32H32zM64 352c0-17.7-14.3-32-32-32s-32 14.3-32 32v96c0 17.7 14.3 32 32 32h96c17.7 0 32-14.3 32-32s-14.3-32-32-32H64V352zM320 32c-17.7 0-32 14.3-32 32s14.3 32 32 32h64v64c0 17.7 14.3 32 32 32s32-14.3 32-32V64c0-17.7-14.3-32-32-32H320zM448 352c0-17.7-14.3-32-32-32s-32 14.3-32 32v64H320c-17.7 0-32 14.3-32 32s14.3 32 32 32h96c17.7 0 32-14.3 32-32V352z",
+}
+const FULLSCREEN_COLLAPSE_ICON = {
+  width: 600,
+  height: 470,
+  name: "fullscreen-collapse",
+  // https://fontawesome.com/icons/compress?f=classic&s=solid
+  path: "M160 64c0-17.7-14.3-32-32-32s-32 14.3-32 32v64H32c-17.7 0-32 14.3-32 32s14.3 32 32 32h96c17.7 0 32-14.3 32-32V64zM32 320c-17.7 0-32 14.3-32 32s14.3 32 32 32H96v64c0 17.7 14.3 32 32 32s32-14.3 32-32V352c0-17.7-14.3-32-32-32H32zM352 64c0-17.7-14.3-32-32-32s-32 14.3-32 32v96c0 17.7 14.3 32 32 32h96c17.7 0 32-14.3 32-32s-14.3-32-32-32H352V64zM320 320c-17.7 0-32 14.3-32 32v96c0 17.7 14.3 32 32 32s32-14.3 32-32V384h64c17.7 0 32-14.3 32-32s-14.3-32-32-32H320z",
+}
+
+interface PlotlyChartProps {
+  element: PlotlyChartProto
+  widgetMgr: WidgetStateManager
+  disabled: boolean
+  fragmentId?: string
+  disableFullscreenMode?: boolean
+  width: number
+  widthConfig?: streamlit.WidthConfig.$Properties | null
+  heightConfig?: streamlit.HeightConfig.$Properties | null
+}
+
+export function PlotlyChart({
+  element,
+  widgetMgr,
+  disabled,
+  fragmentId,
+  disableFullscreenMode,
+  widthConfig,
+  heightConfig,
+}: Readonly<PlotlyChartProps>): ReactElement {
+  const theme = useEmotionTheme()
+  const {
+    expanded: isFullScreen,
+    width: elWidth,
+    height: fullScreenHeight,
+    expand,
+    collapse,
+  } = useRequiredContext(ElementFullscreenContext)
+
+  const { height: chartContainerHeight, elementRef: containerRef } =
+    useCalculatedDimensions([], 0)
+
+  const width = elWidth ?? 0
+
+  // Load the initial figure spec from the element message
+  const initialFigureSpec = useMemo<PlotlyFigureType>(() => {
+    if (!element.spec) {
+      const emptyFigure: PlotlyFigureType = {
+        layout: {},
+        data: [],
+        frames: null,
+      }
+      return emptyFigure
+    }
+
+    const spec: unknown = JSON.parse(element.spec)
+    return migratePlotlyMapboxFigure(spec)
+    // We want to reload the initialFigureSpec object whenever the element id changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- TODO: Update to match React best practices
+  }, [element.id, element.spec])
+
+  // Size-contain charts with stretch or pixel width and height so the
+  // rendered plot cannot grow its parent. Without a definite parent
+  // height, use the figure height or the default height. Fullscreen sets
+  // its own size.
+  const isSizeContained =
+    !isFullScreen &&
+    shouldWidthStretch(widthConfig) &&
+    shouldHeightStretch(heightConfig)
+  const hasFallbackHeight = hasStretchHeightFallback(useContext(FlexContext))
+  const fallbackHeight = plotlyLayoutHeight(initialFigureSpec.layout.height)
+
+  const [plotlyFigure, setPlotlyFigure] = useState<PlotlyFigureType>(() => {
+    // If there was already a state with a figure using the same id,
+    // use that to recover the state. This happens in some situations
+    // where a component un-mounts and mounts again.
+    const initialFigureState = widgetMgr.getElementState<PlotlyFigureType>(
+      element.id,
+      "figure"
+    )
+    if (initialFigureState) {
+      return migratePlotlyMapboxFigure(initialFigureState)
+    }
+    return applyTheming(initialFigureSpec, element.theme, theme)
+  })
+
+  const isSelectionActivated = element.selectionMode.length > 0 && !disabled
+  const isLassoSelectionActivated =
+    isSelectionActivated &&
+    element.selectionMode.includes(PlotlyChartProto.SelectionMode.LASSO)
+  const isBoxSelectionActivated =
+    isSelectionActivated &&
+    element.selectionMode.includes(PlotlyChartProto.SelectionMode.BOX)
+  const isPointsSelectionActivated =
+    isSelectionActivated &&
+    element.selectionMode.includes(PlotlyChartProto.SelectionMode.POINTS)
+
+  const plotlyConfig = useMemo(() => {
+    const config = migratePlotlyMapboxConfig(
+      (element.config ? JSON.parse(element.config) : {}) as Plotly.Config
+    )
+
+    // Customize the plotly toolbar:
+    if (disableFullscreenMode !== true) {
+      // Add a fullscreen button to the plotly toolbar:
+      const fullscreenLabel = isFullScreen ? "Close fullscreen" : "Fullscreen"
+      config.modeBarButtonsToAdd = [
+        {
+          name: fullscreenLabel,
+          // ModeBarButton requires title (hover / accessible name); keep it aligned with name.
+          title: fullscreenLabel,
+          icon: isFullScreen
+            ? FULLSCREEN_COLLAPSE_ICON
+            : FULLSCREEN_EXPAND_ICON,
+          click: () => {
+            if (isFullScreen) {
+              collapse()
+            } else {
+              expand()
+            }
+          },
+        },
+        ...(config.modeBarButtonsToAdd ?? []),
+      ]
+    }
+
+    // plotly.js v4 adds `sendChartToCloud` when `showSendToCloud` is true.
+    // Default the flag off, and also remove the button so layout.modebar.add
+    // cannot put it back unless the app opts in with showSendToCloud: true.
+    config.showSendToCloud ??= false
+
+    // Hide the Plotly logo unless the user explicitly opts in.
+    config.displaylogo ??= false
+
+    const modeBarButtonsToRemove: NonNullable<
+      Plotly.Config["modeBarButtonsToRemove"]
+    > = Array.isArray(config.modeBarButtonsToRemove)
+      ? [...config.modeBarButtonsToRemove]
+      : []
+
+    const removeModeBarButton = (name: Plotly.ModeBarDefaultButtons): void => {
+      if (!modeBarButtonsToRemove.includes(name)) {
+        modeBarButtonsToRemove.push(name)
+      }
+    }
+
+    if (!isSelectionActivated) {
+      // Remove lasso & select buttons in read-only charts
+      removeModeBarButton("lasso2d")
+      removeModeBarButton("select2d")
+    } else {
+      if (!isLassoSelectionActivated) {
+        removeModeBarButton("lasso2d")
+      }
+      if (!isBoxSelectionActivated) {
+        removeModeBarButton("select2d")
+      }
+    }
+
+    if (config.showSendToCloud !== true) {
+      removeModeBarButton("sendChartToCloud")
+    }
+
+    config.modeBarButtonsToRemove = modeBarButtonsToRemove
+    return config
+    // We want to reload the plotlyConfig object whenever the element id changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- TODO: Update to match React best practices
+  }, [
+    element.id,
+    element.config,
+    isFullScreen,
+    disableFullscreenMode,
+    isSelectionActivated,
+    isLassoSelectionActivated,
+    isBoxSelectionActivated,
+    collapse,
+    expand,
+  ])
+
+  useEffect(() => {
+    // If the theme changes, we need to reapply the theming to the figure
+    setPlotlyFigure((prevState: PlotlyFigureType) => {
+      return applyTheming(prevState, element.theme, theme)
+    })
+  }, [element.id, theme, element.theme])
+
+  useEffect(() => {
+    let updatedClickMode: typeof initialFigureSpec.layout.clickmode =
+      initialFigureSpec.layout.clickmode
+    let updatedHoverMode: typeof initialFigureSpec.layout.hovermode =
+      initialFigureSpec.layout.hovermode
+    let updatedDragMode: typeof initialFigureSpec.layout.dragmode =
+      initialFigureSpec.layout.dragmode
+
+    if (disabled) {
+      updatedClickMode = "none"
+      updatedDragMode = "pan"
+    } else if (isSelectionActivated) {
+      // eslint-disable-next-line @typescript-eslint/strict-boolean-expressions -- Plotly types clickmode with `string & {}`, which the rule reads as an object; see comment below
+      if (!initialFigureSpec.layout.clickmode) {
+        // A user-set clickmode is kept. Missing and empty clickmode count as
+        // unset and get the best click mode for the selection modes.
+        if (isPointsSelectionActivated) {
+          // https://plotly.com/javascript/reference/layout/#layout-clickmode
+          // This allows single point selections and shift click to add / remove selections
+          updatedClickMode = "event+select"
+        } else {
+          // If points selection is not activated, we set the clickmode to none (no single item clicks)
+          updatedClickMode = "none"
+        }
+      }
+
+      // eslint-disable-next-line @typescript-eslint/strict-boolean-expressions -- see comment below
+      if (!initialFigureSpec.layout.hovermode) {
+        // A user-set hovermode is kept. Missing, empty, and `false` count as
+        // unset and take the selection default.
+        updatedHoverMode = "closest"
+      }
+
+      // eslint-disable-next-line @typescript-eslint/strict-boolean-expressions -- see comment below
+      if (!initialFigureSpec.layout.dragmode) {
+        // A user-set dragmode is kept. Missing, empty, and `false` count as
+        // unset and get the best drag mode for the selection modes.
+        if (isPointsSelectionActivated) {
+          // Pan drag mode has priority in case points selection is activated
+          updatedDragMode = "pan"
+        } else if (isBoxSelectionActivated) {
+          // Configure select (box selection) as the activated drag mode:
+          updatedDragMode = "select"
+        } else if (isLassoSelectionActivated) {
+          // Configure lasso (lasso selection) as the activated drag mode:
+          updatedDragMode = "lasso"
+        } else {
+          updatedDragMode = "pan"
+        }
+      }
+    }
+
+    setPlotlyFigure((prevState: PlotlyFigureType) => {
+      if (
+        prevState.layout.clickmode === updatedClickMode &&
+        prevState.layout.hovermode === updatedHoverMode &&
+        prevState.layout.dragmode === updatedDragMode
+      ) {
+        // Nothing has changed, just return the previous state
+        return prevState
+      }
+
+      return {
+        ...prevState,
+        layout: {
+          ...prevState.layout,
+          clickmode: updatedClickMode,
+          hovermode: updatedHoverMode,
+          dragmode: updatedDragMode,
+        },
+      }
+    })
+    // We want to reload these options whenever the element id changes
+    // or the selection modes change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- TODO: Update to match React best practices
+  }, [
+    element.id,
+    isSelectionActivated,
+    isPointsSelectionActivated,
+    isBoxSelectionActivated,
+    isLassoSelectionActivated,
+    disabled,
+  ])
+
+  let calculatedWidth =
+    width === -1
+      ? // In some situations - e.g. initial loading of tabs - the width is set to -1
+        // before its able to determine the real width. We want to keep the previous
+        // width in this case.
+        plotlyFigure.layout.width
+      : Math.max(
+          width,
+          // Apply a min width to prevent the chart running into issues with negative
+          // width values if the browser window is too small:
+          MIN_WIDTH
+        )
+
+  // Plotly.js replaces layout.height below 10 with its default of 450,
+  // which paints out of a size-contained box. Hide the plot instead of
+  // passing that height.
+  const isShrunkPlotHidden =
+    isSizeContained &&
+    !hasFallbackHeight &&
+    chartContainerHeight < PLOTLY_MIN_LAYOUT_HEIGHT
+
+  let calculatedHeight =
+    chartContainerHeight >= PLOTLY_MIN_LAYOUT_HEIGHT
+      ? chartContainerHeight
+      : plotlyLayoutHeight(plotlyFigure.layout.height)
+
+  if (isFullScreen) {
+    calculatedWidth = width
+    calculatedHeight = fullScreenHeight ?? DEFAULT_PLOTLY_HEIGHT
+  }
+
+  if (
+    plotlyFigure.layout.height !== calculatedHeight ||
+    plotlyFigure.layout.width !== calculatedWidth
+  ) {
+    // Update the figure with the new height and width (if they have changed)
+    setPlotlyFigure((prevFigure: PlotlyFigureType) => {
+      return {
+        ...prevFigure,
+        layout: {
+          ...prevFigure.layout,
+          height: calculatedHeight,
+          width: calculatedWidth,
+        },
+      }
+    })
+  }
+
+  /**
+   * Callback to handle selections on the plotly chart.
+   */
+  const handleSelectionCallback = useCallback(
+    (event: Readonly<Plotly.PlotSelectionEvent>): void => {
+      handleSelection(event, widgetMgr, element, fragmentId)
+    },
+    // Using element.id instead of element: the proto object gets a new reference
+    // on each render, but element.id only changes when the element actually changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [element.id, widgetMgr, fragmentId]
+  )
+
+  /**
+   * Callback to handle click events on hierarchical charts (treemap, sunburst).
+   */
+  const handleClickCallback = useCallback(
+    (event: Readonly<Plotly.PlotMouseEvent>): void => {
+      handleClickEvent(event, widgetMgr, element, fragmentId)
+    },
+    // Using element.id instead of element: the proto object gets a new reference
+    // on each render, but element.id only changes when the element actually changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [element.id, widgetMgr, fragmentId]
+  )
+
+  const { restart: restartResetSelectionTimeout } = useTimeout(
+    () => {
+      // Reset the selection info within the plotly figure
+      setPlotlyFigure((prevFigure: PlotlyFigureType) => {
+        return {
+          ...prevFigure,
+          data: prevFigure.data.map(trace => {
+            return {
+              ...trace,
+              // Set to null to clear the selection an empty
+              // array here would still show everything as opaque
+              selectedpoints: null,
+            }
+          }),
+          layout: {
+            ...prevFigure.layout,
+            selections: [],
+          },
+        }
+      })
+    },
+    RESET_SELECTION_TIMEOUT_MS,
+    { autoStart: false }
+  )
+
+  /**
+   * Callback resets selections in the chart and
+   * sends out an empty selection state.
+   */
+  const resetSelectionsCallback = useCallback(
+    (resetSelectionInFigure = true): void => {
+      sendEmptySelection(widgetMgr, element, fragmentId)
+
+      if (resetSelectionInFigure) {
+        // We need to do this reset with a short timeout, because otherwise
+        // the onUpdate callback seems to overwrite the selection state
+        // that we set here. The timeout will make sure that this is executed
+        // after the onUpdate callback.
+        restartResetSelectionTimeout()
+      }
+    },
+    // Using element.id instead of element: the proto object gets a new reference
+    // on each render, but element.id only changes when the element actually changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- element intentionally omitted; use stable id.
+    [element.id, widgetMgr, fragmentId, restartResetSelectionTimeout]
+  )
+
+  // This is required for the form clearing functionality:
+  useEffect(() => {
+    if (!element.formId || !isSelectionActivated) {
+      // We don't need the form clear functionality if its not in a form
+      // or if selections are not activated.
+      return
+    }
+
+    const formClearHelper = new FormClearHelper()
+    // On form clear, reset the selections (in chart & widget state)
+    formClearHelper.manageFormClearListener(
+      widgetMgr,
+      element.formId,
+      resetSelectionsCallback
+    )
+
+    return () => {
+      formClearHelper.disconnect()
+    }
+  }, [
+    element.formId,
+    widgetMgr,
+    isSelectionActivated,
+    resetSelectionsCallback,
+  ])
+
+  useEffect(() => {
+    if (!isSelectionActivated) {
+      return
+    }
+    // The point selection during the lasso or box selection seems
+    // to be a bit buggy. Sometimes, points gets unselected without
+    // triggering an onDeselect event.
+    // Therefore, we are deactivating the event+select clickmode
+    // if the dragmode is set to select or lasso.
+    let clickmode: "event+select" | "event" | "none"
+    if (
+      plotlyFigure.layout.dragmode === "select" ||
+      plotlyFigure.layout.dragmode === "lasso"
+    ) {
+      clickmode = "event"
+    } else {
+      // Reset to either none or event+select based on if points selection mode
+      // is activated or not.
+      clickmode = isPointsSelectionActivated ? "event+select" : "none"
+    }
+
+    if (plotlyFigure.layout.clickmode !== clickmode) {
+      setPlotlyFigure((prevFigure: PlotlyFigureType) => {
+        return {
+          ...prevFigure,
+          layout: {
+            ...prevFigure.layout,
+            clickmode: clickmode,
+          },
+        }
+      })
+    }
+    // We only want to trigger this effect if the dragmode changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- TODO: Update to match React best practices
+  }, [plotlyFigure.layout.dragmode])
+
+  // Only name the container when the author provided a non-blank alt.
+  // Blank input is treated as absent: aria-label=" " computes to an empty
+  // accessible name, which is worse than none. role="figure" (not "img")
+  // is required to legally expose aria-label on this otherwise-generic div
+  // without making Plotly's focusable modebar presentational.
+  const trimmedAlt = element.alt?.trim()
+  const accessibleName = isNullOrEmptyString(trimmedAlt)
+    ? undefined
+    : trimmedAlt
+
+  return (
+    <StyledPlotlyChartContainer
+      ref={containerRef}
+      isSizeContained={isSizeContained}
+      fallbackHeight={hasFallbackHeight ? fallbackHeight : undefined}
+      className="stPlotlyChart"
+      data-testid="stPlotlyChart"
+      role={accessibleName !== undefined ? "figure" : undefined}
+      aria-label={accessibleName}
+    >
+      <Plot
+        data={plotlyFigure.data}
+        layout={plotlyFigure.layout}
+        config={plotlyConfig}
+        frames={plotlyFigure.frames ?? undefined}
+        style={{
+          // Hide the plotly chart if the width is not defined yet
+          // to prevent flickering issues.
+          visibility:
+            plotlyFigure.layout.width === undefined ? "hidden" : undefined,
+          display: isShrunkPlotHidden ? "none" : undefined,
+          // If the scrollbars are activated, it leads to flickering issues.
+          // We don't need overflow here since the parent container and plot dimensions are in sync.
+          overflow: "hidden",
+        }}
+        onSelected={isSelectionActivated ? handleSelectionCallback : () => {}}
+        // Handle click events for hierarchical charts (treemap, sunburst)
+        // that don't emit plotly_selected but do emit plotly_click
+        onClick={isPointsSelectionActivated ? handleClickCallback : undefined}
+        // Double click is needed to make it easier to the user to
+        // reset the selection. The default handling can be a bit annoying
+        // sometimes.
+        onDoubleClick={
+          isSelectionActivated ? () => resetSelectionsCallback() : undefined
+        }
+        onDeselect={
+          isSelectionActivated
+            ? () => {
+                // Plotly is also resetting the UI state already for
+                // deselect events. So, we don't need to do it on our side.
+                // Thats why the flag is false.
+                resetSelectionsCallback(false)
+              }
+            : undefined
+        }
+        onInitialized={figure => {
+          widgetMgr.setElementState(element.id, "figure", figure)
+        }}
+        // Update the figure state on every change to the figure itself:
+        onUpdate={figure => {
+          // Save the updated figure state to allow it to be recovered
+          widgetMgr.setElementState(element.id, "figure", figure)
+          setPlotlyFigure(figure)
+        }}
+      />
+    </StyledPlotlyChartContainer>
+  )
+}
+
+const PlotlyChartWidthCheck: FC<Omit<PlotlyChartProps, "width">> = props => {
+  const { width } = useRequiredContext(ElementFullscreenContext)
+
+  // If the width is not defined yet, we don't want to render the chart because
+  // it can cause issues with Plotly's rendering where elements will be
+  // positioned incorrectly
+  if (!width) {
+    return null
+  }
+
+  return <PlotlyChart width={width} {...props} />
+}
+
+const PlotlyChartWithFullScreenWrapper = withFullScreenWrapper(
+  PlotlyChartWidthCheck
+)
+export default memo(PlotlyChartWithFullScreenWrapper)

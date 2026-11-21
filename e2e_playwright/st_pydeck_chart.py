@@ -1,0 +1,655 @@
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+from typing import Any, cast
+
+import numpy as np
+import pandas as pd
+import pydeck as pdk
+
+import streamlit as st
+
+np.random.seed(12345)
+
+random_scatter_sf = pd.DataFrame(
+    cast("Any", np.random.randn(1000, 2) / [50, 50]) + [37.76, -122.4],  # noqa: RUF005
+    columns=["lat", "lon"],
+)
+
+H3_HEX_DATA = [
+    {"hex": "88283082b9fffff", "count": 10},
+    {"hex": "88283082d7fffff", "count": 50},
+    {"hex": "88283082a9fffff", "count": 100},
+]
+hex_data = pd.DataFrame(H3_HEX_DATA)
+
+
+def empty_chart_subtest():
+    st.write("""
+    ## Test empty chart
+    """)
+
+    st.pydeck_chart()
+
+
+def basic_chart_subtest():
+    st.write("""
+    ## Test basic chart
+
+    Should show a map with default settings and random data centered in SF, using
+    hex and scatter plots.
+    """)
+
+    st.pydeck_chart(
+        pdk.Deck(
+            initial_view_state=pdk.ViewState(
+                latitude=37.76,
+                longitude=-122.4,
+                zoom=11,
+                pitch=50,
+            ),
+            layers=[
+                pdk.Layer(
+                    "HexagonLayer",
+                    data=random_scatter_sf,
+                    get_position="[lon, lat]",
+                    radius=200,
+                    elevation_scale=4,
+                    elevation_range=[0, 1000],
+                    pickable=True,
+                    extruded=True,
+                ),
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf,
+                    get_position="[lon, lat]",
+                    get_fill_color="[200, 30, 0, 160]",
+                    get_radius=200,
+                ),
+            ],
+        )
+    )
+
+
+def invalid_prop_subtest():
+    st.write("""
+    ## Test invalid property
+
+    See [issue #5799.](https://github.com/streamlit/streamlit/issues/5799)
+
+    You should see a map with a single datapoint. There should be no error message.
+    """)
+
+    data = pd.DataFrame(
+        {"lng": [-109.037673], "lat": [36.994672], "weight": [math.nan]}
+    )
+
+    layer = pdk.Layer(
+        "ScatterplotLayer", data=data, get_position=["lng", "lat"], radius_min_pixels=4
+    )
+
+    deck = pdk.Deck(
+        layers=[layer],
+        map_style=pdk.map_styles.CARTO_LIGHT,
+        tooltip={"text": "weight: {weight}"},
+    )
+
+    st.pydeck_chart(deck, width="stretch")
+
+
+def map_styles_subtest():
+    st.write("""
+    ## Test map styles
+
+    You should see a colorful "road"-style map with 3 green hex prisms.
+    """)
+
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="road",
+            tooltip={"text": "Count: {count}"},
+            initial_view_state=pdk.ViewState(
+                latitude=37.7749295,
+                longitude=-122.4194155,
+                zoom=12,
+                bearing=0,
+                pitch=30,
+            ),
+            layers=[
+                pdk.Layer(
+                    "H3HexagonLayer",
+                    hex_data,
+                    pickable=True,
+                    stroked=True,
+                    filled=True,
+                    get_hexagon="hex",
+                    get_fill_color="[0, 255, 0]",
+                    get_line_color=[255, 255, 255],
+                    line_width_min_pixels=2,
+                ),
+            ],
+        )
+    )
+
+
+def light_style_subtest():
+    st.write("""
+    ## Test light style
+
+    Should show a _light_ map with random data centered in SF, using hex and scatter plots.
+    """)
+
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="light",
+            initial_view_state=pdk.ViewState(
+                latitude=37.76,
+                longitude=-122.4,
+                zoom=11,
+                pitch=50,
+            ),
+            layers=[
+                pdk.Layer(
+                    "HexagonLayer",
+                    data=random_scatter_sf,
+                    get_position="[lon, lat]",
+                    radius=200,
+                    elevation_scale=4,
+                    elevation_range=[0, 1000],
+                    pickable=True,
+                    extruded=True,
+                ),
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf,
+                    get_position="[lon, lat]",
+                    get_fill_color="[200, 30, 0, 160]",
+                    get_radius=200,
+                ),
+            ],
+        )
+    )
+
+
+def dark_style_subtest():
+    st.write("""
+    ## Test dark style
+
+    Should show a _dark_ map with random data centered in SF, using hex and scatter plots.
+    """)
+
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="dark",
+            initial_view_state=pdk.ViewState(
+                latitude=37.76,
+                longitude=-122.4,
+                zoom=11,
+                pitch=50,
+            ),
+            layers=[
+                pdk.Layer(
+                    "HexagonLayer",
+                    data=random_scatter_sf,
+                    get_position="[lon, lat]",
+                    radius=200,
+                    elevation_scale=4,
+                    elevation_range=[0, 1000],
+                    pickable=True,
+                    extruded=True,
+                ),
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf,
+                    get_position="[lon, lat]",
+                    get_fill_color="[200, 30, 0, 160]",
+                    get_radius=200,
+                ),
+            ],
+        )
+    )
+
+
+def mapbox_subtest():
+    st.write("""
+    ## Test with Mapbox provider
+
+    You should see a "satellite"-style map served by Mapbox with random data centered in SF.
+    This test requires an API key to be set. See MAPBOX_API_KEY in our Github automation.
+    """)
+
+    st.pydeck_chart(
+        pdk.Deck(
+            map_provider="mapbox",
+            tooltip={"text": "Count: {count}"},
+            initial_view_state=pdk.ViewState(
+                latitude=37.7749295,
+                longitude=-122.4194155,
+                zoom=12,
+                bearing=0,
+                pitch=30,
+            ),
+            layers=[
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf,
+                    get_position="[lon, lat]",
+                    get_fill_color="[200, 30, 0, 160]",
+                    get_radius=200,
+                ),
+            ],
+        )
+    )
+
+
+def layer_extensions_subtest():
+    st.write("""
+    ## Test deck.gl layer extensions
+
+    Should show two high-value points (DataFilterExtension) and a dashed
+    path (PathStyleExtension).
+    """)
+
+    points = pd.DataFrame(
+        [
+            {"lat": 37.75, "lon": -122.45, "value": 10},
+            {"lat": 37.76, "lon": -122.42, "value": 80},
+            {"lat": 37.77, "lon": -122.4, "value": 90},
+            {"lat": 37.76, "lon": -122.38, "value": 20},
+        ]
+    )
+    path_data = [
+        {
+            "path": [
+                [-122.45, 37.75],
+                [-122.42, 37.76],
+                [-122.4, 37.77],
+                [-122.38, 37.76],
+            ],
+        }
+    ]
+
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="light",
+            initial_view_state=pdk.ViewState(
+                latitude=37.76,
+                longitude=-122.42,
+                zoom=12,
+                pitch=0,
+            ),
+            layers=[
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=points,
+                    id="filtered-points",
+                    get_position="[lon, lat]",
+                    get_fill_color="[200, 30, 0, 200]",
+                    get_radius=120,
+                    radius_min_pixels=8,
+                    get_filter_value="value",
+                    filter_range=[50, 100],
+                    # pydeck has no Extension class, so extensions are passed as @@type dicts.
+                    extensions=[{"@@type": "DataFilterExtension", "filterSize": 1}],
+                ),
+                pdk.Layer(
+                    "PathLayer",
+                    data=path_data,
+                    id="dashed-path",
+                    get_path="path",
+                    get_color=[220, 20, 60],
+                    get_width=20,
+                    width_min_pixels=6,
+                    get_dash_array=[8, 4],
+                    extensions=[{"@@type": "PathStyleExtension", "dash": True}],
+                ),
+            ],
+        ),
+        height=400,
+    )
+
+
+def width_parameter_subtest():
+    st.write("""
+    ## Test width parameter
+
+    Test the new width parameter with different values.
+    """)
+
+    st.write("**Chart with width='stretch' (default):**")
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="light",
+            initial_view_state=pdk.ViewState(
+                latitude=37.76,
+                longitude=-122.4,
+                zoom=11,
+                pitch=30,
+            ),
+            layers=[
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf.head(50),
+                    get_position="[lon, lat]",
+                    get_fill_color="[30, 200, 0, 160]",
+                    get_radius=200,
+                ),
+            ],
+        ),
+        width="stretch",
+    )
+
+    st.write("**Chart with width=200 and height=250:**")
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="road",
+            initial_view_state=pdk.ViewState(
+                latitude=37.7749295,
+                longitude=-122.4194155,
+                zoom=12,
+                bearing=0,
+                pitch=30,
+            ),
+            layers=[
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf.head(50),
+                    get_position="[lon, lat]",
+                    get_fill_color="[255, 165, 0, 160]",
+                    get_radius=200,
+                ),
+            ],
+        ),
+        width=200,
+        height=250,
+    )
+
+
+def height_parameter_subtest():
+    st.write("""
+    ## Test height parameter
+
+    Test the new height parameter with different values.
+    """)
+
+    st.write("**Chart with no specified height (default to 500px):**")
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="light",
+            initial_view_state=pdk.ViewState(
+                latitude=37.76,
+                longitude=-122.4,
+                zoom=11,
+                pitch=30,
+            ),
+            layers=[
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf.head(50),
+                    get_position="[lon, lat]",
+                    get_fill_color="[30, 200, 0, 160]",
+                    get_radius=200,
+                ),
+            ],
+        ),
+    )
+
+    st.write("**Chart with height='stretch' (default to minimum height of 6.25rem):**")
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="light",
+            initial_view_state=pdk.ViewState(
+                latitude=37.76,
+                longitude=-122.4,
+                zoom=11,
+                pitch=30,
+            ),
+            layers=[
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf.head(50),
+                    get_position="[lon, lat]",
+                    get_fill_color="[30, 200, 0, 160]",
+                    get_radius=200,
+                ),
+            ],
+        ),
+        height="stretch",
+    )
+
+    st.write("**Chart with height='stretch' (in 600px container):**")
+    with st.container(border=True, key="test_height_stretch", height=600):
+        st.pydeck_chart(
+            pdk.Deck(
+                map_style="dark",
+                initial_view_state=pdk.ViewState(
+                    latitude=37.7749295,
+                    longitude=-122.4194155,
+                    zoom=12,
+                    bearing=0,
+                    pitch=30,
+                ),
+                layers=[
+                    pdk.Layer(
+                        "ScatterplotLayer",
+                        data=random_scatter_sf.head(50),
+                        get_position="[lon, lat]",
+                        get_fill_color="[200, 30, 0, 160]",
+                        get_radius=200,
+                    ),
+                ],
+            ),
+            height="stretch",
+        )
+
+    st.write("**Chart with height=50:**")
+    # Test a small height value to verify that the minimum height constraint for stretch height
+    # does not affect user-defined pixel heights.
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style="road",
+            initial_view_state=pdk.ViewState(
+                latitude=37.7749295,
+                longitude=-122.4194155,
+                zoom=12,
+                bearing=0,
+                pitch=30,
+            ),
+            layers=[
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf.head(50),
+                    get_position="[lon, lat]",
+                    get_fill_color="[255, 165, 0, 160]",
+                    get_radius=200,
+                ),
+            ],
+        ),
+        height=50,
+    )
+
+
+def orbit_point_cloud_subtest():
+    st.write("## Test OrbitView + PointCloudLayer")
+    rng = np.random.default_rng(0)
+    n = 250
+    theta, phi = rng.uniform(0, 2 * np.pi, n), rng.uniform(0, np.pi, n)
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=[
+                pdk.Layer(
+                    "PointCloudLayer",
+                    data=pd.DataFrame(
+                        {
+                            "x": np.sin(phi) * np.cos(theta),
+                            "y": np.sin(phi) * np.sin(theta),
+                            "z": np.cos(phi),
+                            "r": rng.integers(40, 255, n),
+                            "g": rng.integers(40, 255, n),
+                            "b": rng.integers(40, 255, n),
+                        }
+                    ),
+                    get_position=["x", "y", "z"],
+                    get_color=["r", "g", "b"],
+                    point_size=4,
+                ),
+            ],
+            initial_view_state=pdk.ViewState(
+                target=[0, 0, 0], zoom=5, rotation_x=15, rotation_orbit=30
+            ),
+            views=[pdk.View(type="OrbitView", controller=True)],
+            map_provider=None,
+        ),
+        height=400,
+    )
+
+
+def globe_view_subtest():
+    st.write("## Test GlobeView")
+    patch = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [-20.0, -10.0],
+                            [50.0, -10.0],
+                            [50.0, 40.0],
+                            [-20.0, 40.0],
+                            [-20.0, -10.0],
+                        ]
+                    ],
+                },
+            }
+        ],
+    }
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=[
+                pdk.Layer(
+                    "GeoJsonLayer",
+                    data=patch,
+                    filled=True,
+                    stroked=True,
+                    get_fill_color=[30, 120, 180, 220],
+                    get_line_color=[255, 255, 255],
+                ),
+            ],
+            views=[pdk.View(type="_GlobeView", controller=True)],
+            initial_view_state=pdk.ViewState(latitude=20, longitude=10, zoom=0),
+            map_provider=None,
+        ),
+        height=400,
+    )
+
+
+def tooltip_position_subtest():
+    st.pydeck_chart(
+        pdk.Deck(
+            map_provider=None,
+            tooltip={"text": "Test point"},
+            initial_view_state=pdk.ViewState(
+                latitude=37.76,
+                longitude=-122.4,
+                zoom=12,
+                pitch=0,
+                bearing=0,
+            ),
+            layers=[
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=pd.DataFrame({"lat": [37.76], "lon": [-122.4]}),
+                    get_position="[lon, lat]",
+                    get_fill_color=[200, 30, 0, 220],
+                    get_radius=40,
+                    radius_min_pixels=40,
+                    pickable=True,
+                ),
+            ],
+        ),
+        height=500,
+    )
+
+
+def omit_fill_color_subtest():
+    st.write("""
+    ## Omit fill color (theme primary default)
+
+    A ScatterplotLayer without get_fill_color uses the theme primary color at
+    alpha 160.
+    """)
+
+    st.pydeck_chart(
+        pdk.Deck(
+            map_style=None,
+            initial_view_state=pdk.ViewState(
+                latitude=37.76,
+                longitude=-122.4,
+                zoom=11,
+            ),
+            layers=[
+                pdk.Layer(
+                    "ScatterplotLayer",
+                    data=random_scatter_sf.head(80),
+                    get_position="[lon, lat]",
+                    get_radius=200,
+                    radius_min_pixels=6,
+                ),
+            ],
+        ),
+        height=400,
+        width="stretch",
+    )
+
+
+def alt_chart_subtest():
+    st.write("## Accessible name (`alt`)")
+
+    deck = pdk.Deck(
+        initial_view_state=pdk.ViewState(
+            latitude=37.76,
+            longitude=-122.4,
+            zoom=11,
+        ),
+        layers=[
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=random_scatter_sf,
+                get_position="[lon, lat]",
+                get_color="[200, 30, 0, 160]",
+                get_radius=100,
+            ),
+        ],
+    )
+
+    # st.pydeck_chart with the default on_select="ignore" emits no st-key-*
+    # class, so wrap each chart in a keyed container to target it.
+    with st.container(key="pydeck_with_alt"):
+        st.pydeck_chart(
+            deck,
+            alt="Scatter map of sample points near San Francisco",
+        )
+    with st.container(key="pydeck_without_alt"):
+        st.pydeck_chart(deck)
+
+
+SUBTESTS = {k: v for k, v in globals().items() if k.endswith("_subtest")}
+
+subtest = SUBTESTS[st.selectbox("Test to run", SUBTESTS.keys())]
+
+subtest()

@@ -1,0 +1,551 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { useMemo } from "react"
+
+import { useEmotionTheme } from "~lib/hooks/useEmotionTheme"
+import type { EmotionTheme } from "~lib/theme/types"
+import { isNullOrUndefined } from "~lib/util/utils"
+
+import {
+  aliasDatasetReferences,
+  getAliasedDataSets,
+  type VegaLiteChartElement,
+} from "./arrowUtils"
+import { resolveNamedColorsInSpec } from "./colorUtils"
+import { applyStreamlitTheme, applyThemeDefaults } from "./CustomTheme"
+import {
+  applyLargeDataDefaults,
+  type DatasetRowCounts,
+  getDatasetRowCounts,
+} from "./largeDataDefaults"
+
+/**
+ * A loosely-typed VegaLite spec after JSON parsing.
+ * We use Record<string, unknown> because we mutate the spec in place
+ * and access dynamic keys that don't align with the strict vega-lite TopLevelSpec type.
+ */
+type VegaLiteSpec = Record<string, unknown>
+
+/** A single VegaLite selection/binding parameter within spec.params. */
+interface VegaLiteParam {
+  /** Parsed from the user's spec JSON, so it can be `null`. */
+  select?:
+    | null
+    | string
+    | {
+        type?: string
+        encodings?: string[]
+        fields?: string[]
+        [key: string]: unknown
+      }
+  [key: string]: unknown
+}
+
+interface VegaLiteUsermeta {
+  embedOptions?: {
+    theme?: string | null
+    renderer?: string
+    padding?:
+      | number
+      | { left?: number; right?: number; top?: number; bottom?: number }
+    [key: string]: unknown
+  } | null
+  [key: string]: unknown
+}
+
+/**
+ * Fix bug where Vega Lite was vertically-cropping the x-axis in some cases.
+ */
+const BOTTOM_PADDING = 20
+
+function getUsermeta(spec: VegaLiteSpec): VegaLiteUsermeta | undefined {
+  if (
+    spec.usermeta === null ||
+    typeof spec.usermeta !== "object" ||
+    Array.isArray(spec.usermeta)
+  ) {
+    return undefined
+  }
+
+  return spec.usermeta as VegaLiteUsermeta
+}
+
+function isNonNegativeFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+}
+
+function sanitizeRenderer(renderer: unknown): string | undefined {
+  return typeof renderer === "string" &&
+    ["svg", "canvas", "hybrid"].includes(renderer)
+    ? renderer
+    : undefined
+}
+
+function sanitizePadding(
+  padding: unknown
+):
+  | number
+  | { left?: number; right?: number; top?: number; bottom?: number }
+  | undefined {
+  if (isNonNegativeFiniteNumber(padding)) {
+    return padding
+  }
+
+  if (
+    padding === null ||
+    typeof padding !== "object" ||
+    Array.isArray(padding)
+  ) {
+    return undefined
+  }
+
+  const sanitizedPadding: {
+    left?: number
+    right?: number
+    top?: number
+    bottom?: number
+  } = {}
+  for (const side of ["left", "right", "top", "bottom"] as const) {
+    const value = (padding as Record<string, unknown>)[side]
+    if (isNonNegativeFiniteNumber(value)) {
+      sanitizedPadding[side] = value
+    }
+  }
+
+  return Object.keys(sanitizedPadding).length > 0
+    ? sanitizedPadding
+    : undefined
+}
+
+function sanitizeUsermetaEmbedOptions(spec: VegaLiteSpec): void {
+  const usermeta = getUsermeta(spec)
+  if (!usermeta || !("embedOptions" in usermeta)) {
+    return
+  }
+
+  const sanitizedEmbedOptions: NonNullable<VegaLiteUsermeta["embedOptions"]> =
+    {}
+  const embedOptions = usermeta.embedOptions
+
+  const theme = embedOptions?.theme
+  if (theme !== "streamlit" && (typeof theme === "string" || theme === null)) {
+    sanitizedEmbedOptions.theme = theme
+  }
+
+  const renderer = sanitizeRenderer(embedOptions?.renderer)
+  if (renderer !== undefined) {
+    sanitizedEmbedOptions.renderer = renderer
+  }
+
+  const padding = sanitizePadding(embedOptions?.padding)
+  if (padding !== undefined) {
+    sanitizedEmbedOptions.padding = padding
+  }
+
+  if (Object.keys(sanitizedEmbedOptions).length > 0) {
+    usermeta.embedOptions = sanitizedEmbedOptions
+    return
+  }
+
+  delete usermeta.embedOptions
+}
+
+/**
+ * Prepares the vega-lite spec for selections by transforming the select parameters
+ * to a full object specification and by adding encodings to point selections
+ * that specify neither encodings nor fields.
+ *
+ * The changes are applied in-place to the spec object.
+ *
+ * @param spec The Vega-Lite specification of the chart.
+ */
+function prepareSpecForSelections(spec: VegaLiteSpec): void {
+  if ("params" in spec && "encoding" in spec) {
+    ;(spec.params as VegaLiteParam[]).forEach((param: VegaLiteParam) => {
+      if (!("select" in param)) {
+        // We are only interested in transforming select parameters.
+        // Other parameters are skipped.
+        return
+      }
+
+      if (
+        typeof param.select === "string" &&
+        ["interval", "point"].includes(param.select)
+      ) {
+        // The select object can be either a single string (short-hand) specifying
+        // "interval" or "point" or an object that can contain additional
+        // properties as defined here: https://vega.github.io/vega-lite/docs/selection.html
+        // We convert the short-hand notation to the full object specification,
+        // so that we can attach additional properties to this below.
+        param.select = {
+          type: param.select,
+        }
+      }
+
+      if (
+        typeof param.select !== "object" ||
+        param.select === null ||
+        !("type" in param.select)
+      ) {
+        // The type property is required in the spec.
+        // But we check anyways and skip all parameters that don't have it.
+        return
+      }
+
+      // Point selections that already declare encodings or fields are projected
+      // by the user. Injecting encodings on top of fields unions the projections,
+      // which duplicates bound widgets and breaks scalar selection values.
+      if (
+        param.select.type === "point" &&
+        !("encodings" in param.select) &&
+        isNullOrUndefined(param.select.encodings) &&
+        !("fields" in param.select) &&
+        isNullOrUndefined(param.select.fields)
+      ) {
+        // Without encodings or fields, Vega-Lite resolves a point selection as
+        // IndexSelection. Add the chart encodings so it becomes a PointSelection:
+        // https://github.com/altair-viz/altair/issues/3285#issuecomment-1858860696
+        param.select.encodings = Object.keys(
+          spec.encoding as Record<string, unknown>
+        )
+      }
+    })
+  }
+}
+
+const generateSpec = (
+  inputSpec: string,
+  useContainerWidth: boolean,
+  useContainerHeight: boolean,
+  vegaLiteTheme: string,
+  selectionMode: string[],
+  theme: EmotionTheme,
+  rowCounts: DatasetRowCounts,
+  containerWidth: number,
+  containerHeight?: number,
+  alt: string = ""
+): VegaLiteSpec => {
+  const spec = JSON.parse(inputSpec) as VegaLiteSpec & {
+    title?: string | { text?: string; limit?: number }
+    padding?: { bottom?: number }
+    config?: object
+  }
+
+  // Author `alt` wins over any top-level description already in the spec JSON.
+  if (alt) {
+    spec.description = alt
+  }
+
+  // Normalize legacy "0"/non-positive sizing semantics: Historically, a
+  // top-level width/height of 0 behaved like "unspecified" (Vega-Lite fell back
+  // to its default height/auto width). After
+  // https://github.com/vega/vega-lite/commit/0ff85059ef1c444b78218a36678fc2af7131a7aa
+  // a value of 0 is treated as an explicit size, which results in charts
+  // effectively rendering at 0px. To ensure charts render, treat non-positive
+  // numeric values as "no value" and let Vega-Lite apply its own defaults.
+  if (typeof spec.height === "number" && spec.height <= 0) {
+    delete spec.height
+  }
+
+  if (typeof spec.width === "number" && spec.width <= 0) {
+    delete spec.width
+  }
+  const usermetaTheme = getUsermeta(spec)?.embedOptions?.theme
+
+  if (vegaLiteTheme === "streamlit" || usermetaTheme === "streamlit") {
+    spec.config = applyStreamlitTheme(spec.config, theme)
+  } else {
+    // Apply minor theming improvements to work better with Streamlit
+    spec.config = applyThemeDefaults(spec.config, theme)
+  }
+  // Keep only safe vega-embed presentation options for compatibility. Streamlit's
+  // theme is applied above and removed so vega-embed doesn't try to resolve it.
+  // Behavior-bearing options stay stripped, including chart actions that open
+  // same-origin pages with serialized spec contents.
+  sanitizeUsermetaEmbedOptions(spec)
+
+  // Render large charts to canvas and skip per-mark ARIA, unless the author
+  // set the renderer or ARIA.
+  applyLargeDataDefaults(spec, rowCounts)
+
+  // eslint-disable-next-line @typescript-eslint/strict-boolean-expressions -- title may be a string, array, object, or null; a missing or empty title is left unchanged
+  if (spec.title) {
+    const title =
+      typeof spec.title === "string" ? { text: spec.title } : spec.title
+    title.limit =
+      // Preserve existing limit if it exists,
+      title.limit ??
+      // Otherwise, calculate the width - 40px to give some padding, especially
+      // for the ... menu button. If the width is less than 40px, we set it to
+      // 0 to avoid negative values.
+      Math.max(containerWidth - 40, 0)
+    spec.title = title
+  }
+
+  // Only apply a container-derived height when we have a positive measurement.
+  // `containerHeight` is -1 until the ResizeObserver has measured the element
+  // and we also avoid writing 0, since Vega-Lite now treats 0 as an explicit
+  // size.
+  // @see https://github.com/vega/vega-lite/commit/0ff85059ef1c444b78218a36678fc2af7131a7aa
+  if (useContainerHeight && containerHeight && containerHeight > 0) {
+    spec.height = containerHeight
+  }
+
+  // Same rationale as height: guard against the initial -1 sentinel and 0 so
+  // that we only set `spec.width` when the container has a real, positive
+  // width measurement.
+  if (useContainerWidth && containerWidth && containerWidth > 0) {
+    spec.width = containerWidth
+
+    if ("vconcat" in spec) {
+      ;(spec.vconcat as (VegaLiteSpec | null)[]).forEach(child => {
+        // Skip non-object children (defensive check)
+        if (child === null || typeof child !== "object") {
+          return
+        }
+        // Skip setting width on children that are nested compositions
+        // (hconcat, vconcat, concat, facet, repeat) as it causes
+        // "infinite extent" errors.
+        // Layer children should still receive width so layered + vconcat charts
+        // can stretch consistently.
+        // In valid Vega-Lite specs, composition operators are always top-level keys.
+        if (
+          "hconcat" in child ||
+          "vconcat" in child ||
+          "concat" in child ||
+          "facet" in child ||
+          "repeat" in child
+        ) {
+          return
+        }
+        child.width = containerWidth
+      })
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- falsy padding, including 0, is replaced so bottom can be set
+  if (!spec.padding) {
+    spec.padding = {}
+  }
+
+  if (isNullOrUndefined(spec.padding.bottom)) {
+    spec.padding.bottom = BOTTOM_PADDING
+  }
+
+  if (selectionMode.length > 0) {
+    prepareSpecForSelections(spec)
+  }
+
+  // Resolve built-in color names (red, blue, etc.) to theme color values
+  resolveNamedColorsInSpec(spec, theme)
+
+  return spec
+}
+
+/**
+ * Preprocesses the element to generate the VegaLite spec.
+ * It stabilizes some of the references (e.g. selectionMode and spec)
+ * and avoids further processing if unnecessary.
+ *
+ * Returns the processed element along with a `baseSpecKey` that is stable
+ * across container dimension changes (for use with native Vega resize API).
+ */
+export const useVegaElementPreprocessor = (
+  element: VegaLiteChartElement,
+  containerWidth: number,
+  containerHeight: number,
+  useContainerWidth: boolean,
+  useContainerHeight: boolean
+): VegaLiteChartElement & { baseSpecKey: string } => {
+  const theme = useEmotionTheme()
+
+  const {
+    id,
+    formId,
+    spec: inputSpec,
+    data,
+    datasets,
+    vegaLiteTheme,
+    selectionMode: inputSelectionMode,
+    alt = "",
+  } = element
+
+  // Selection Mode is an array, so we want to update it only when the contents
+  // change, not the reference itself (since each forward message would be a new
+  // reference).
+  const selectionModeKey = JSON.stringify(inputSelectionMode)
+  const selectionMode = useMemo(() => {
+    return inputSelectionMode
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deep comparison via serialized key
+  }, [selectionModeKey])
+
+  // Compare row counts by value so the spec regenerates only when a count
+  // changes. Every rerun delivers new dataset objects.
+  const rowCountsKey = JSON.stringify(getDatasetRowCounts(data, datasets))
+  const rowCounts = useMemo(
+    () => JSON.parse(rowCountsKey) as DatasetRowCounts,
+    [rowCountsKey]
+  )
+
+  // Map each dataset name to its alias. Memoize on the serialized names,
+  // because every rerun delivers new dataset objects.
+  const datasetNamesKey = JSON.stringify(
+    datasets.map(({ hasName, name }) => (hasName ? name : null))
+  )
+  const datasetAliases = useMemo(
+    () =>
+      new Map(
+        Array.from(getAliasedDataSets(datasets), ([alias, { name }]) => [
+          name,
+          alias,
+        ])
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deep comparison via serialized key
+    [datasetNamesKey]
+  )
+
+  // The structural spec generated with neutral (0) container dimensions. This is
+  // only recomputed when non-dimension inputs change, keeping it stable across
+  // container resizes.
+  const baseSpec = useMemo(
+    () =>
+      generateSpec(
+        inputSpec,
+        useContainerWidth,
+        useContainerHeight,
+        vegaLiteTheme,
+        selectionMode,
+        theme,
+        rowCounts,
+        0, // Use 0 for container dimensions
+        0,
+        alt
+      ),
+    [
+      inputSpec,
+      useContainerWidth,
+      useContainerHeight,
+      vegaLiteTheme,
+      selectionMode,
+      theme,
+      rowCounts,
+      alt,
+    ]
+  )
+
+  // Stable key that changes only when non-dimension parts of the spec change,
+  // OR when fixed (non-container-driven) dimensions change.
+  // Container-driven dimensions are excluded because they change frequently during
+  // resize and we handle those via Vega's native resize API for better performance.
+  // Fixed dimensions (from the spec itself) are included because they represent
+  // intentional user-specified sizes that should trigger a view recreation.
+  // We also include useContainerWidth/useContainerHeight booleans in the key because
+  // transitioning to/from container-driven sizing (e.g., entering fullscreen) requires
+  // a full view recreation to properly apply the new dimensions.
+  // Concat compositions (vconcat/hconcat/concat) bake per-child dimensions at
+  // view-creation time, which Vega's native resize API cannot update. For these
+  // charts we include the container dimensions in the key so a container-driven
+  // dimension change triggers a full view recreation (preserving correct
+  // resizing), instead of the native-resize fast path used for single-view charts.
+  const isConcatComposition =
+    "vconcat" in baseSpec || "hconcat" in baseSpec || "concat" in baseSpec
+  // Only concat compositions need container dimensions baked into the key. For
+  // single-view charts these stay `undefined`, so the memo below does not
+  // recompute on every resize (the native resize fast-path handles those).
+  const concatWidth =
+    isConcatComposition && useContainerWidth ? containerWidth : undefined
+  const concatHeight =
+    isConcatComposition && useContainerHeight ? containerHeight : undefined
+
+  const baseSpecKey = useMemo(() => {
+    // Only strip dimensions that are container-driven.
+    // Fixed dimensions from the spec should be included in the key.
+    const specForKey = { ...baseSpec }
+    if (useContainerWidth) {
+      delete specForKey.width
+    }
+    if (useContainerHeight) {
+      delete specForKey.height
+    }
+    // Include the sizing mode flags so that transitioning to/from
+    // container-driven sizing triggers a view recreation.
+    return JSON.stringify(
+      {
+        spec: specForKey,
+        useContainerWidth,
+        useContainerHeight,
+        concatWidth,
+        concatHeight,
+      },
+      // Key dataset references by alias, not name. Altair names a dataset by
+      // a hash of its contents, so new data would otherwise rebuild the view
+      // instead of swapping the new rows into it.
+      aliasDatasetReferences(datasetAliases)
+    )
+  }, [
+    baseSpec,
+    datasetAliases,
+    useContainerWidth,
+    useContainerHeight,
+    concatWidth,
+    concatHeight,
+  ])
+
+  const spec = useMemo(
+    () =>
+      generateSpec(
+        inputSpec,
+        useContainerWidth,
+        useContainerHeight,
+        vegaLiteTheme,
+        selectionMode,
+        theme,
+        rowCounts,
+        containerWidth,
+        containerHeight,
+        alt
+      ),
+    [
+      inputSpec,
+      useContainerWidth,
+      useContainerHeight,
+      vegaLiteTheme,
+      selectionMode,
+      theme,
+      rowCounts,
+      containerWidth,
+      containerHeight,
+      alt,
+    ]
+  )
+
+  return {
+    id,
+    formId,
+    vegaLiteTheme,
+    // generateSpec returns a parsed object, but VegaLiteChartElement.spec
+    // is typed as string. Downstream consumers (useVegaEmbed) pass this
+    // directly to vega-embed which accepts both strings and objects.
+    spec: spec as unknown as string,
+    selectionMode,
+    data,
+    datasets,
+    useContainerWidth,
+    alt,
+    baseSpecKey,
+  }
+}

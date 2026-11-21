@@ -1,0 +1,241 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { parseToRgba, rgba, transparentize } from "color2k"
+import { describe, expect, it } from "vitest"
+
+import { darkTheme, lightTheme, mockTheme } from "@streamlit/lib"
+import { PageConfig } from "@streamlit/protobuf"
+
+import {
+  clampSidebarWidth,
+  getSidebarResizeHandleBackgroundImage,
+  getSidebarResizeHandleHoverBorderColor,
+  getSidebarWidthLimits,
+  shouldCollapse,
+} from "./utils"
+
+const sidebarWidthLimits = getSidebarWidthLimits(
+  mockTheme.emotion.sizes,
+  mockTheme.emotion.fontSizes.baseFontSize
+)
+const { minWidthPx, maxWidthPx, defaultWidthPx } = sidebarWidthLimits
+
+describe("shouldCollapse", () => {
+  it("should collapse given state is collapsed", () => {
+    expect(
+      shouldCollapse(PageConfig.SidebarState.COLLAPSED, 50, 100)
+    ).toBeTruthy()
+  })
+
+  it("should not collapse given state is expanded", () => {
+    expect(
+      shouldCollapse(PageConfig.SidebarState.EXPANDED, 50, 100)
+    ).toBeFalsy()
+  })
+
+  it("should not collapse given state is locked and viewport is desktop-width", () => {
+    // Wider than breakpoint — sidebar is pinned open
+    expect(
+      shouldCollapse(PageConfig.SidebarState.LOCKED, 500, 1200)
+    ).toBeFalsy()
+  })
+
+  it("should collapse given state is locked and viewport is mobile-width", () => {
+    // Narrower than breakpoint — lock degrades so the overlay sidebar doesn't trap users
+    expect(
+      shouldCollapse(PageConfig.SidebarState.LOCKED, 500, 400)
+    ).toBeTruthy()
+  })
+
+  it("should collapse given state is auto and width is less than breakpoint", () => {
+    const windowInnerWidth = 40
+    expect(
+      shouldCollapse(PageConfig.SidebarState.AUTO, 50, windowInnerWidth)
+    ).toBeTruthy()
+  })
+
+  it("should not collapse given state is auto and width greater less than breakpoint", () => {
+    const windowInnerWidth = 60
+    expect(
+      shouldCollapse(PageConfig.SidebarState.AUTO, 50, windowInnerWidth)
+    ).toBeFalsy()
+  })
+})
+
+describe("getSidebarWidthLimits", () => {
+  it("converts the theme rem tokens to pixels", () => {
+    expect(minWidthPx).toBe(200)
+    expect(defaultWidthPx).toBe(300)
+    expect(maxWidthPx).toBe(600)
+  })
+
+  it("scales the rem tokens with a custom baseFontSize", () => {
+    const limits = getSidebarWidthLimits(mockTheme.emotion.sizes, 14)
+    expect(limits.minWidthPx).toBe(175)
+    expect(limits.defaultWidthPx).toBe(262.5)
+    expect(limits.maxWidthPx).toBe(525)
+  })
+})
+
+describe("clampSidebarWidth", () => {
+  describe("minimum width clamping", () => {
+    it("should clamp values below the theme minimum", () => {
+      const testCases = [50, Number.NEGATIVE_INFINITY, Number.MIN_SAFE_INTEGER]
+
+      testCases.forEach(width => {
+        expect(clampSidebarWidth(width, sidebarWidthLimits)).toBe(minWidthPx)
+      })
+    })
+
+    it("should handle exactly minimum width", () => {
+      expect(clampSidebarWidth(minWidthPx, sidebarWidthLimits)).toBe(
+        minWidthPx
+      )
+    })
+  })
+
+  describe("maximum width clamping", () => {
+    it("should clamp values above the theme maximum", () => {
+      const testCases = [
+        1000,
+        Number.POSITIVE_INFINITY,
+        Number.MAX_SAFE_INTEGER,
+      ]
+
+      testCases.forEach(width => {
+        expect(clampSidebarWidth(width, sidebarWidthLimits)).toBe(maxWidthPx)
+      })
+    })
+
+    it("should handle exactly maximum width", () => {
+      expect(clampSidebarWidth(maxWidthPx, sidebarWidthLimits)).toBe(
+        maxWidthPx
+      )
+    })
+  })
+
+  describe("valid width range", () => {
+    it("should return width unchanged when within valid bounds", () => {
+      const validWidths = [defaultWidthPx, 250.5]
+
+      validWidths.forEach(width => {
+        expect(clampSidebarWidth(width, sidebarWidthLimits)).toBe(width)
+      })
+    })
+  })
+
+  describe("edge cases and error handling", () => {
+    it("should handle boundary values correctly", () => {
+      expect(clampSidebarWidth(minWidthPx - 1, sidebarWidthLimits)).toBe(
+        minWidthPx
+      )
+      expect(clampSidebarWidth(maxWidthPx + 1, sidebarWidthLimits)).toBe(
+        maxWidthPx
+      )
+    })
+
+    it("should handle special numeric values", () => {
+      expect(clampSidebarWidth(Number.NaN, sidebarWidthLimits)).toBe(
+        defaultWidthPx
+      )
+      expect(clampSidebarWidth(Number.MAX_VALUE, sidebarWidthLimits)).toBe(
+        maxWidthPx
+      )
+      expect(clampSidebarWidth(Number.MIN_VALUE, sidebarWidthLimits)).toBe(
+        minWidthPx
+      )
+    })
+  })
+})
+
+describe("getSidebarResizeHandleHoverBorderColor", () => {
+  it("increases borderColor opacity by the documented step", () => {
+    expect(
+      getSidebarResizeHandleHoverBorderColor(transparentize("#000000", 0.8))
+    ).toBe("rgba(0, 0, 0, 0.3)")
+  })
+
+  it("preserves the rgb of an opaque custom borderColor", () => {
+    const borderColor = "#00008B"
+    const [r, g, b] = parseToRgba(borderColor)
+
+    expect(getSidebarResizeHandleHoverBorderColor(borderColor)).toBe(
+      rgba(r, g, b, 1)
+    )
+  })
+
+  it("clamps alpha at 1 for near-opaque custom borderColor", () => {
+    const borderColor = "rgba(0, 0, 139, 0.95)"
+
+    expect(
+      parseToRgba(getSidebarResizeHandleHoverBorderColor(borderColor))[3]
+    ).toBe(1)
+  })
+
+  it.each([
+    ["light", lightTheme.emotion.colors.borderColor],
+    ["dark", darkTheme.emotion.colors.borderColor],
+  ] as const)(
+    "clamps at full opacity for the default opaque %s theme borderColor",
+    (_name, borderColor) => {
+      const [, , , alpha] = parseToRgba(borderColor)
+      const [, , , hoverAlpha] = parseToRgba(
+        getSidebarResizeHandleHoverBorderColor(borderColor)
+      )
+
+      expect(alpha).toBe(1)
+      expect(hoverAlpha).toBe(1)
+    }
+  )
+})
+
+describe("getSidebarResizeHandleBackgroundImage", () => {
+  it("uses a wider gradient fade on hover", () => {
+    const borderColor = "#cccccc"
+
+    expect(
+      getSidebarResizeHandleBackgroundImage(borderColor, { isHovered: false })
+    ).toContain("transparent 36%")
+    expect(
+      getSidebarResizeHandleBackgroundImage(borderColor, { isHovered: true })
+    ).toContain("transparent 44%")
+  })
+
+  it("uses the provided borderColor in the gradient", () => {
+    const hoverBorderColor = getSidebarResizeHandleHoverBorderColor(
+      transparentize("#000000", 0.8)
+    )
+
+    expect(
+      getSidebarResizeHandleBackgroundImage(hoverBorderColor, {
+        isHovered: true,
+      })
+    ).toBe(
+      `linear-gradient(to right, transparent 20%, ${hoverBorderColor} 28%, transparent 44%)`
+    )
+  })
+
+  it("keeps the provided borderColor when building a rest gradient", () => {
+    const borderColor = "#cccccc"
+
+    expect(
+      getSidebarResizeHandleBackgroundImage(borderColor, { isHovered: false })
+    ).toBe(
+      `linear-gradient(to right, transparent 20%, ${borderColor} 28%, transparent 36%)`
+    )
+  })
+})

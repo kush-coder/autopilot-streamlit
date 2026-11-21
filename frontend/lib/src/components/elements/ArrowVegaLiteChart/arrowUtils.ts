@@ -1,0 +1,257 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { isPlainObject } from "lodash-es"
+
+import { isNullOrEmptyString } from "@streamlit/utils"
+
+import {
+  DataFrameCellType,
+  type DataType,
+  getTimezone,
+  isDatetimeType,
+  isDateType,
+  isNumericType,
+} from "~lib/dataframes/arrowTypeUtils"
+import type { Quiver } from "~lib/dataframes/Quiver"
+import { isNullOrUndefined } from "~lib/util/utils"
+
+const MagicFields = {
+  DATAFRAME_INDEX: "(index)",
+}
+
+/** All of the data that makes up a VegaLite chart. */
+export interface VegaLiteChartElement {
+  /**
+   * The dataframe that will be used as the chart's main data source, if
+   * specified using Vega-Lite's inline API.
+   *
+   * This is mutually exclusive with WrappedNamedDataset - if `data` is non-null,
+   * `datasets` will not be populated; if `datasets` is populated, then `data`
+   * will be null.
+   */
+  data: Quiver | null
+
+  /** The a JSON-formatted string with the Vega-Lite spec. */
+  spec: string
+
+  /**
+   * Dataframes associated with this chart using Vega-Lite's datasets API,
+   * if any.
+   */
+  datasets: WrappedNamedDataset[]
+
+  /** If True, will overwrite the chart width spec to fit to container. */
+  useContainerWidth: boolean
+
+  /** override the properties with a theme. Currently, only "streamlit" or None are accepted. */
+  vegaLiteTheme: string
+
+  /** The widget ID. Only set if selections are activated. */
+  id: string
+
+  /** Named selection parameters that are activated to trigger reruns. */
+  selectionMode: string[]
+
+  /** The form ID if the chart has activated selections and is used within a form. */
+  formId: string
+
+  /**
+   * Accessible name from the author `alt` parameter. Applied as Vega-Lite
+   * `description` (→ aria-label on role="graphics-document") when non-empty.
+   * Never present in the hashed protobuf `spec` string.
+   */
+  alt?: string
+}
+
+/** A mapping of `ArrowNamedDataSet.proto`. */
+export interface WrappedNamedDataset {
+  /** The dataset's optional name. */
+  name: string | null
+
+  /** True if the name field (above) was manually set. */
+  hasName: boolean
+
+  /** The data itself, wrapped in a Quiver object. */
+  data: Quiver
+}
+
+/** A single row of data for VegaLite visualization, mapping field names to cell values. */
+type VegaLiteDataRow = Record<string, DataType>
+
+export function getInlineData(
+  quiverData: Quiver | null
+): VegaLiteDataRow[] | null {
+  if (!quiverData || quiverData.dimensions.numDataRows === 0) {
+    return null
+  }
+
+  return getDataArray(quiverData)
+}
+
+export function getDataArrays(
+  datasets: WrappedNamedDataset[]
+): Record<string, VegaLiteDataRow[]> | null {
+  const datasetMapping = getDataSets(datasets)
+  if (isNullOrUndefined(datasetMapping)) {
+    return null
+  }
+
+  const datasetArrays: Record<string, VegaLiteDataRow[]> = {}
+
+  for (const [name, dataset] of Object.entries(datasetMapping)) {
+    datasetArrays[name] = getDataArray(dataset)
+  }
+
+  return datasetArrays
+}
+
+export function getDataSets(
+  datasets: WrappedNamedDataset[]
+): { [dataset: string]: Quiver } | null {
+  if (datasets.length === 0) {
+    return null
+  }
+
+  const datasetMapping: { [dataset: string]: Quiver } = {}
+
+  datasets.forEach((x: WrappedNamedDataset) => {
+    const name = x.hasName ? x.name : null
+    datasetMapping[name as string] = x.data
+  })
+
+  return datasetMapping
+}
+
+/** A chart dataset, as listed by {@link getAliasedDataSets}. */
+interface AliasedDataset {
+  /** The dataset's name in the spec (`"null"` for an unnamed dataset). */
+  name: string
+  /** The dataset's rows. */
+  data: Quiver
+}
+
+/**
+ * Gives each chart dataset a positional alias (`__st_dataset_0`,
+ * `__st_dataset_1`, ...) so a renamed dataset can be matched to the one it
+ * replaces. Altair names datasets by a hash of their contents, so new data
+ * renames them. The aliases stay the same as long as the chart sends its
+ * datasets in the same order.
+ */
+export function getAliasedDataSets(
+  datasets: WrappedNamedDataset[]
+): Map<string, AliasedDataset> {
+  return new Map(
+    Object.entries(getDataSets(datasets) ?? {}).map(([name, data], index) => [
+      `__st_dataset_${index}`,
+      { name, data },
+    ])
+  )
+}
+
+/**
+ * Returns a `JSON.stringify` replacer that writes each dataset reference
+ * (`{"data": {"name": ...}}` in any view, layer, or lookup) with its alias
+ * instead of its name, so the serialized spec ignores dataset renames.
+ * References to names missing from `aliases`, such as GeoJSON datasets kept
+ * inside the spec, are left unchanged.
+ *
+ * @param aliases The alias of each dataset name (see {@link getAliasedDataSets}).
+ */
+export function aliasDatasetReferences(
+  aliases: ReadonlyMap<string, string>
+): (key: string, value: unknown) => unknown {
+  return (key, value) => {
+    if (key !== "data" || !isPlainObject(value)) {
+      return value
+    }
+    const { name } = value as { name?: unknown }
+    const alias = typeof name === "string" ? aliases.get(name) : undefined
+    return alias === undefined ? value : { ...(value as object), name: alias }
+  }
+}
+
+/**
+ * Retrieves an array of data from Quiver.
+ * Converts data values to a format compatible with VegaLite visualization.
+ *
+ * @param {Quiver} quiverData - The Quiver data object to extract data from.
+ * @returns {VegaLiteDataRow[]} An array of data objects for visualization.
+ */
+export function getDataArray(quiverData: Quiver): VegaLiteDataRow[] {
+  if (quiverData.dimensions.numDataRows === 0) {
+    return []
+  }
+
+  const dataArr = []
+  const { numDataRows, numDataColumns, numIndexColumns } =
+    quiverData.dimensions
+
+  // This currently only implemented to work with a single index column.
+  // If the dataframe is multi-index, the remaining index columns will be ignored.
+  const firstIndexColumnType = quiverData.columnTypes.at(0)
+  const hasSupportedIndex =
+    firstIndexColumnType?.type === DataFrameCellType.INDEX &&
+    (isNumericType(firstIndexColumnType) ||
+      isDatetimeType(firstIndexColumnType) ||
+      isDateType(firstIndexColumnType))
+
+  for (let rowIndex = 0; rowIndex < numDataRows; rowIndex++) {
+    const row: VegaLiteDataRow = {}
+
+    if (hasSupportedIndex) {
+      const { content: indexValue } = quiverData.getCell(rowIndex, 0)
+      // VegaLite can't handle BigInts, so they have to be converted to Numbers first
+      // Converting to numbers here might loses accuracy for numbers larger than the max safe integer.
+      row[MagicFields.DATAFRAME_INDEX] =
+        typeof indexValue === "bigint" ? Number(indexValue) : indexValue
+    }
+
+    for (let colIndex = 0; colIndex < numDataColumns; colIndex++) {
+      // The underlying dataframe expects the column position to start at 0 with
+      // the index columns first. Therefore, we need to adjust the position
+      // to account for the index columns.
+      const colPos = colIndex + numIndexColumns
+      const { content: dataValue, contentType: dataType } = quiverData.getCell(
+        rowIndex,
+        colPos
+      )
+
+      if (
+        (dataValue instanceof Date ||
+          (typeof dataValue === "number" && Number.isFinite(dataValue))) &&
+        (isDatetimeType(dataType) || isDateType(dataType)) &&
+        // Only convert dates without timezone information
+        // to utc timezone
+        isNullOrEmptyString(getTimezone(dataType))
+      ) {
+        // For dates that do not contain timezone information.
+        // Vega JS assumes dates in the local timezone, so we need to convert
+        // UTC date to be the same date in the local timezone.
+        const offset = new Date(dataValue).getTimezoneOffset() * 60 * 1000 // minutes to milliseconds
+        row[quiverData.columnNames[0][colPos]] = dataValue.valueOf() + offset
+      } else {
+        // VegaLite can't handle BigInts, so they have to be converted to Numbers first.
+        // Converting to numbers here might loses accuracy for numbers larger than the max safe integer.
+        row[quiverData.columnNames[0][colPos]] =
+          typeof dataValue === "bigint" ? Number(dataValue) : dataValue
+      }
+    }
+    dataArr.push(row)
+  }
+
+  return dataArr
+}

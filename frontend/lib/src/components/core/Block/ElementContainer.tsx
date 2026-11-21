@@ -1,0 +1,122 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import {
+  memo,
+  type ReactElement,
+  type ReactNode,
+  Suspense,
+  useContext,
+} from "react"
+
+import type { ElementNode } from "~lib/AppNode"
+import { ViewStateContext } from "~lib/components/core/ViewStateContext"
+import { SquareSkeleton } from "~lib/components/elements/Skeleton/styled-components"
+import ErrorBoundary from "~lib/components/shared/ErrorBoundary/ErrorBoundary"
+import { getElementId } from "~lib/util/utils"
+
+import type { ElementContainerConfig } from "./ElementContainerConfig"
+import { RetainedElementContext } from "./RetainedElementContext"
+import { PendingSkeletonOverlay } from "./SkeletonPlaceholders"
+import { StyledElementContainerLayoutWrapper } from "./StyledElementContainerLayoutWrapper"
+import { convertKeyToClassName, getKeyFromId } from "./utils"
+
+export interface ElementContainerProps {
+  /** The element node being rendered */
+  node: ElementNode
+  /** Configuration for layout container styling */
+  config: ElementContainerConfig
+  /** Whether the element is stale (from a previous script run) */
+  isStale: boolean
+  /** The element to render inside the container */
+  children: ReactNode
+}
+
+/**
+ * Wrapper component that encapsulates the element container layers:
+ * - StyledElementContainerLayoutWrapper (layout styling)
+ * - ErrorBoundary (error handling)
+ * - Suspense (lazy loading fallback)
+ *
+ * Used in each case block of RawElementNodeRenderer to wrap elements
+ * with their specific configuration.
+ *
+ * @example
+ * ```typescript
+ * case "textArea": {
+ *   const config = new ElementContainerConfig({
+ *     minStretchWidth: MinStretchWidth.MEDIUM,
+ *     styleOverrides: { height: "auto" },
+ *   })
+ *   return (
+ *     <ElementContainer node={node} config={config} isStale={isStale}>
+ *       <TextArea {...props} />
+ *     </ElementContainer>
+ *   )
+ * }
+ * ```
+ */
+export const ElementContainer = memo(function ElementContainer({
+  node,
+  config,
+  isStale,
+  children,
+}: ElementContainerProps): ReactElement {
+  const { isFullScreen } = useContext(ViewStateContext)
+  const isRetained = useContext(RetainedElementContext)
+
+  const elementType = node.element.type ?? ""
+  const elementId = getElementId(node.element)
+  const userKey = getKeyFromId(elementId)
+  // A skeleton waits to replace this element, which stays mounted until then.
+  // Like the stale fade, the overlay is off while any element is in fullscreen.
+  const hasPendingSkeleton =
+    node.pendingSkeleton !== undefined && !isFullScreen
+
+  return (
+    <StyledElementContainerLayoutWrapper
+      className={[
+        "stElementContainer",
+        "element-container",
+        convertKeyToClassName(userKey),
+        config.printLayout,
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      data-testid="stElementContainer"
+      data-stale={isStale}
+      data-retained={isRetained || undefined}
+      aria-busy={hasPendingSkeleton || undefined}
+      isStale={isStale && !isFullScreen}
+      isRetained={isRetained}
+      hasPendingSkeleton={hasPendingSkeleton}
+      elementType={elementType}
+      node={node}
+      config={config}
+    >
+      <ErrorBoundary>
+        <Suspense
+          fallback={
+            <SquareSkeleton data-testid="stSkeleton" aria-hidden="true" />
+          }
+        >
+          {children}
+        </Suspense>
+      </ErrorBoundary>
+      {hasPendingSkeleton && <PendingSkeletonOverlay />}
+    </StyledElementContainerLayoutWrapper>
+  )
+})

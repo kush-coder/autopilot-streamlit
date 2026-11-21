@@ -1,0 +1,156 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import styled from "@emotion/styled"
+
+import { getSecondaryIconButtonColorStyles } from "~lib/components/shared/Base/styled-components"
+import { StyledBorderlessIconButton } from "~lib/components/shared/BaseButton/styled-components"
+
+export const StyledAudioInputContainerDiv = styled.div()
+
+export const StyledWaveformContainerDiv = styled.div<{ disabled?: boolean }>(
+  ({ theme, disabled = false }) => ({
+    height: theme.sizes.largestElementHeight,
+    width: "100%",
+    background: theme.colors.secondaryBg,
+    borderRadius: theme.radii.default,
+    display: "flex",
+    alignItems: "center",
+    position: "relative",
+    paddingLeft: theme.spacing.xs,
+    paddingRight: theme.spacing.sm,
+    border:
+      theme.colors.widgetBorderColor !== undefined
+        ? `${theme.sizes.borderWidth} solid ${theme.colors.widgetBorderColor}`
+        : undefined,
+    cursor: disabled ? "not-allowed" : "auto",
+    overflow: "hidden",
+  })
+)
+
+export const StyledWaveformInnerDiv = styled.div({
+  flex: 1,
+})
+
+export const StyledWaveSurferDiv = styled.div<{ show: boolean }>(
+  ({ show, theme }) => ({
+    display: show ? "block" : "none",
+    // CRITICAL: scrollingWaveform creates TWO WaveSurfer instances (recording + playback)
+    // as sibling divs. Stack them with relative positioning so they overlap.
+    position: "relative",
+    height: theme.sizes.largestElementHeight,
+    // Each WaveSurfer child div should be absolutely positioned to stack
+    "& > div": {
+      position: "absolute",
+      top: 0,
+      left: 0,
+      width: "100%",
+      height: "100%",
+      // Use flexbox to center the shadow DOM content vertically
+      display: "flex",
+      alignItems: "center",
+    },
+  })
+)
+
+export const StyledWaveformTimeCode = styled.span<{
+  isPlayingOrRecording: boolean
+  disabled?: boolean
+}>(({ theme, isPlayingOrRecording, disabled = false }) => ({
+  margin: theme.spacing.sm,
+  fontFamily: theme.fonts.monospace,
+  color: disabled
+    ? theme.colors.fadedText40
+    : isPlayingOrRecording
+      ? theme.colors.bodyText
+      : theme.colors.fadedText70,
+  backgroundColor: theme.colors.secondaryBg,
+  fontSize: theme.fontSizes.sm,
+}))
+
+export const StyledErrorContainerDiv = styled.div({
+  width: "100%",
+  textAlign: "center",
+  overflow: "hidden",
+})
+
+export const StyledErrorTextSpan = styled.span(({ theme }) => ({
+  color: theme.colors.bodyText,
+}))
+
+export const StyledNoMicInputLearnMoreLink = styled.a(({ theme }) => ({
+  color: theme.colors.link,
+  textDecoration: theme.linkUnderline ? "underline" : "none",
+}))
+
+// Placeholder
+export const StyledPlaceholderContainerDiv = styled.div(({ theme }) => ({
+  flex: 1,
+  height: theme.sizes.largestElementHeight,
+  display: "flex",
+  justifyContent: "center",
+  alignItems: "center",
+}))
+
+export const StyledPlaceholderDotsDiv = styled.div(({ theme }) => {
+  const dotSize = "0.625em"
+  return {
+    opacity: 0.2,
+    width: "100%",
+    height: dotSize,
+    backgroundSize: dotSize,
+    backgroundImage: `radial-gradient(${theme.colors.fadedText10} 40%, transparent 40%)`,
+    backgroundRepeat: "repeat",
+  }
+})
+
+/**
+ * Stop-recording icon: primary at rest, red on hover/focus-visible.
+ * Extends BORDERLESS_ICON so the color rules apply to the button itself rather
+ * than through a wrapper selector.
+ */
+export const StyledStopRecordingActionButton = styled(
+  StyledBorderlessIconButton
+)(({ theme }) => ({
+  padding: theme.spacing.threeXS,
+  color: theme.colors.primary,
+  "&:hover, &:focus-visible": {
+    color: theme.colors.redColor,
+  },
+}))
+
+/**
+ * Record / play / pause / reset icon button. Extends BORDERLESS_ICON so this
+ * class is applied with the parent class; later source order lets
+ * `fadedText40` beat BaseButton’s `fadedText10` at the same specificity.
+ */
+export const StyledSecondaryIconActionButton = styled(
+  StyledBorderlessIconButton
+)(({ theme }) => ({
+  padding: theme.spacing.threeXS,
+  ...getSecondaryIconButtonColorStyles(theme),
+}))
+
+export const StyledActionButtonContainerDiv = styled.div(({ theme }) => ({
+  display: "flex",
+  justifyContent: "center",
+  alignItems: "center",
+  flexGrow: 0,
+  flexShrink: 1,
+  padding: theme.spacing.xs,
+  gap: theme.spacing.twoXS,
+  marginRight: theme.spacing.twoXS,
+}))

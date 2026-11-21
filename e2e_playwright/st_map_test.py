@@ -1,0 +1,177 @@
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pytest
+from playwright.sync_api import Page, expect
+
+from e2e_playwright.conftest import ImageCompareFunction, wait_for_app_loaded
+from e2e_playwright.shared.app_utils import check_top_level_class, get_element_by_key
+from e2e_playwright.shared.theme_utils import apply_theme_via_window
+from e2e_playwright.shared.toolbar_utils import (
+    assert_fullscreen_toolbar_button_interactions,
+)
+
+MAP_ELEMENT_COUNT = 5
+PIXEL_THRESHOLD = 0.1
+
+
+# Pydeck snapshots behavior is inconsistent for non-Chromium browsers in CI.
+@pytest.mark.only_browser("chromium")
+def test_st_map_has_consistent_visuals(
+    themed_app: Page, assert_snapshot: ImageCompareFunction
+):
+    maps = themed_app.get_by_test_id("stDeckGlJsonChart")
+    expect(maps).to_have_count(MAP_ELEMENT_COUNT, timeout=15000)
+
+    # The map assets can take more time to load, add an extra timeout
+    # to prevent flakiness.
+    themed_app.wait_for_timeout(10000)
+
+    # The pydeck tests are a lot flakier than need be so increase the pixel threshold
+    assert_snapshot(
+        maps.nth(0),
+        name="st_map-empty",
+        pixel_threshold=PIXEL_THRESHOLD,
+    )
+
+    assert_snapshot(
+        maps.nth(0).locator(".mapboxgl-ctrl-group").nth(0),
+        name="st_map-zoom_controls",
+    )
+
+    # Hover on the zoom out button
+    maps.nth(0).locator(".mapboxgl-ctrl-zoom-out").hover()
+    assert_snapshot(
+        maps.nth(0).locator(".mapboxgl-ctrl-group").nth(0),
+        name="st_map-zoom_out_hover",
+    )
+
+    # The pydeck tests are a lot flakier than need be so increase the pixel threshold
+    assert_snapshot(
+        maps.nth(1).locator("canvas").nth(1),
+        name="st_map-simple_map",
+        pixel_threshold=PIXEL_THRESHOLD,
+    )
+
+    # The pydeck tests are a lot flakier than need be so increase the pixel threshold
+    assert_snapshot(
+        maps.nth(2).locator("canvas").nth(1),
+        name="st_map-simple_map_with_zoom",
+        pixel_threshold=PIXEL_THRESHOLD,
+    )
+
+    # The pydeck tests are a lot flakier than need be so increase the pixel threshold
+    assert_snapshot(
+        maps.nth(3).locator("canvas").nth(1),
+        name="st_map-map_with_color_and_size_layers",
+        pixel_threshold=PIXEL_THRESHOLD,
+    )
+
+    # The pydeck tests are a lot flakier than need be so increase the pixel threshold
+    assert_snapshot(
+        maps.nth(4),
+        name="st_map-width_and_height",
+        pixel_threshold=PIXEL_THRESHOLD,
+    )
+
+
+# Pydeck snapshots behavior is inconsistent for non-Chromium browsers in CI.
+@pytest.mark.only_browser("chromium")
+def test_st_map_default_markers_use_custom_primary_color(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Default map markers follow a custom theme primaryColor (snapshot)."""
+    # Loud green, distinct from the stock Streamlit primary red.
+    apply_theme_via_window(app, base="light", primaryColor="#00C853")
+    app.reload()
+    wait_for_app_loaded(app)
+
+    maps = app.get_by_test_id("stDeckGlJsonChart")
+    expect(maps).to_have_count(MAP_ELEMENT_COUNT, timeout=15000)
+    # Map tiles/assets can take extra time; match other st_map snapshot waits.
+    app.wait_for_timeout(10000)
+
+    # Simple map (no color=) — markers should use the injected primary.
+    assert_snapshot(
+        maps.nth(1).locator("canvas").nth(1),
+        name="st_map-simple_map_custom_primary",
+        pixel_threshold=PIXEL_THRESHOLD,
+    )
+
+
+def test_check_top_level_class(app: Page):
+    """Check that the top level class is correctly set."""
+    # Wait for map to be loaded:
+    expect(app.get_by_test_id("stDeckGlJsonChart")).to_have_count(
+        MAP_ELEMENT_COUNT, timeout=15000
+    )
+
+    check_top_level_class(app, "stDeckGlJsonChart")
+
+
+# Pydeck snapshots behavior is inconsistent for non-Chromium browsers in CI.
+@pytest.mark.only_browser("chromium")
+def test_st_map_clicking_on_fullscreen_toolbar_button(
+    app: Page, assert_snapshot: ImageCompareFunction
+):
+    """Test that clicking on fullscreen toolbar button expands the map into fullscreen."""
+
+    expect(app.get_by_test_id("stDeckGlJsonChart")).to_have_count(
+        MAP_ELEMENT_COUNT, timeout=15000
+    )
+    # The map assets can take more time to load, add an extra timeout
+    # to prevent flakiness.
+    app.wait_for_timeout(10000)
+
+    assert_fullscreen_toolbar_button_interactions(
+        app,
+        assert_snapshot=assert_snapshot,
+        widget_test_id="stDeckGlJsonChart",
+        filename_prefix="st_map",
+        # The pydeck tests are a lot flakier than need be so increase the pixel threshold
+        pixel_threshold=PIXEL_THRESHOLD,
+    )
+
+
+def test_map_alt_sets_accessible_name(app: Page):
+    """`alt` becomes the map container's accessible name."""
+    expect(app.get_by_test_id("stDeckGlJsonChart")).to_have_count(
+        MAP_ELEMENT_COUNT, timeout=15000
+    )
+
+    labeled = get_element_by_key(app, "map_with_alt").get_by_test_id(
+        "stDeckGlJsonChart"
+    )
+    expect(labeled).to_have_attribute("role", "figure")
+    expect(labeled).to_have_accessible_name(
+        "Scatter map of sample points near San Francisco"
+    )
+    # role=figure (not img) keeps the Streamlit toolbar operable. Playwright
+    # treats opacity:0 as visible, so assert the toolbar is actually revealed.
+    labeled.hover()
+    expect(labeled.get_by_test_id("stElementToolbar")).to_have_css("opacity", "1")
+    expect(
+        labeled.get_by_role(
+            "button",
+            name="Fullscreen: Scatter map of sample points near San Francisco",
+            exact=True,
+        )
+    ).to_be_visible()
+
+    unlabeled = get_element_by_key(app, "map_without_alt").get_by_test_id(
+        "stDeckGlJsonChart"
+    )
+    expect(unlabeled).not_to_have_attribute("role")
+    expect(unlabeled).not_to_have_attribute("aria-label")
+    expect(unlabeled).to_have_accessible_name("")

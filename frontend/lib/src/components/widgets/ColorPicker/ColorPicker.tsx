@@ -1,0 +1,134 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { type FC, memo, useCallback } from "react"
+
+import type { ColorPicker as ColorPickerProto } from "@streamlit/protobuf"
+import { isNullOrEmptyString } from "@streamlit/utils"
+
+import BaseColorPicker from "~lib/components/shared/BaseColorPicker/BaseColorPicker"
+import {
+  useBasicWidgetState,
+  type ValueWithSource,
+} from "~lib/hooks/useBasicWidgetState"
+import { labelVisibilityProtoValueToEnum } from "~lib/util/utils"
+import type { WidgetStateManager } from "~lib/WidgetStateManager"
+
+export interface Props {
+  disabled: boolean
+  element: ColorPickerProto
+  widgetMgr: WidgetStateManager
+  fragmentId?: string
+}
+
+/**
+ * The value specified by the user via the UI. If the user didn't touch this
+ * widget's UI, the default value is used.
+ */
+type ColorPickerValue = string
+
+const getStateFromWidgetMgr = (
+  widgetMgr: WidgetStateManager,
+  element: ColorPickerProto
+): ColorPickerValue | undefined => {
+  return widgetMgr.getStringValue(element)
+}
+
+const getDefaultStateFromProto = (
+  element: ColorPickerProto
+): ColorPickerValue => {
+  return element.default
+}
+
+const getCurrStateFromProto = (
+  element: ColorPickerProto
+): ColorPickerValue => {
+  return element.value
+}
+
+const updateWidgetMgrState = (
+  element: ColorPickerProto,
+  widgetMgr: WidgetStateManager,
+  valueWithSource: ValueWithSource<ColorPickerValue>,
+  fragmentId: string | undefined
+): void => {
+  widgetMgr.setStringValue(element.id, valueWithSource.value, {
+    formId: element.formId,
+    fragmentId,
+    fromUser: valueWithSource.fromUser,
+    // on_change="ignore" buffers the value without scheduling a rerun.
+    // WidgetStateManager ignores triggerRerun inside forms (the form owns
+    // commit timing).
+    ...(element.ignoreRerun ? { triggerRerun: false } : {}),
+  })
+}
+
+const ColorPicker: FC<Props> = ({
+  element,
+  disabled,
+  widgetMgr,
+  fragmentId,
+}) => {
+  const queryParamBinding = !isNullOrEmptyString(element.queryParamKey)
+    ? {
+        paramKey: element.queryParamKey,
+        valueType: "string_value" as const,
+        // Color picker is not clearable (always defaults to black)
+        clearable: false,
+      }
+    : undefined
+
+  const [value, setValueWithSource] = useBasicWidgetState<
+    ColorPickerValue,
+    ColorPickerProto
+  >({
+    getStateFromWidgetMgr,
+    getDefaultStateFromProto,
+    getCurrStateFromProto,
+    updateWidgetMgrState,
+    element,
+    widgetMgr,
+    fragmentId,
+    formClearBehavior: "resetValueOnly",
+    queryParamBinding,
+  })
+
+  const handleColorClose = useCallback(
+    (color: string): void => {
+      // BaseColorPicker reports the draft on every close, so skip closes that
+      // keep the current color (react-color emits lowercase hex, while the
+      // proto value may be uppercase).
+      if (color.toLowerCase() === value.toLowerCase()) return
+      setValueWithSource({ value: color, fromUser: true })
+    },
+    [setValueWithSource, value]
+  )
+
+  return (
+    <BaseColorPicker
+      label={element.label}
+      labelVisibility={labelVisibilityProtoValueToEnum(
+        element.labelVisibility?.value
+      )}
+      help={element.help}
+      onChange={handleColorClose}
+      disabled={disabled}
+      value={value}
+    />
+  )
+}
+
+export default memo(ColorPicker)

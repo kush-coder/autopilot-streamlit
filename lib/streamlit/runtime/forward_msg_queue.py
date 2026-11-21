@@ -1,0 +1,334 @@
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from streamlit.proto.ForwardMsg_pb2 import ForwardMsg
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+class ForwardMsgQueue:
+    """Accumulates a session's outgoing ForwardMsgs.
+
+    Each AppSession adds messages to its queue, and the Server periodically
+    flushes all session queues and delivers their messages to the appropriate
+    clients.
+
+    ForwardMsgQueue is not thread-safe - a queue should only be used from
+    a single thread.
+    """
+
+    _before_enqueue_msg: Callable[[ForwardMsg], None] | None = None
+
+    @staticmethod
+    def on_before_enqueue_msg(
+        before_enqueue_msg: Callable[[ForwardMsg], None] | None,
+    ) -> None:
+        """Set a callback to be called before a message is enqueued.
+        Used in static streamlit app generation.
+        """
+        ForwardMsgQueue._before_enqueue_msg = before_enqueue_msg
+
+    def __init__(self) -> None:
+        self._queue: list[ForwardMsg] = []
+        # A mapping of (delta_path -> _queue.indexof(msg)) for each
+        # Delta message in the queue. We use this for coalescing
+        # redundant outgoing Deltas (where a newer Delta supersedes
+        # an older Delta, with the same delta_path, that's still in the
+        # queue).
+        self._delta_index_map: dict[tuple[int, ...], int] = {}
+
+    def get_debug(self) -> dict[str, Any]:
+        from google.protobuf.json_format import MessageToDict
+
+        return {
+            "queue": [MessageToDict(m) for m in self._queue],
+            "ids": list(self._delta_index_map.keys()),
+        }
+
+    def is_empty(self) -> bool:
+        return len(self._queue) == 0
+
+    def enqueue(self, msg: ForwardMsg) -> None:
+        """Add message into queue, possibly composing it with another message."""
+
+        if ForwardMsgQueue._before_enqueue_msg:
+            ForwardMsgQueue._before_enqueue_msg(msg)
+
+        if not _is_composable_message(msg):
+            self._queue.append(msg)
+            return
+
+        # If there's a Delta message with the same delta_path already in
+        # the queue - meaning that it refers to the same location in
+        # the app - we attempt to combine this new Delta into the old
+        # one. This is an optimization that prevents redundant Deltas
+        # from being sent to the frontend.
+        # One common case where this happens is with `st.write` since
+        # it uses a trick with `st.empty` to handle lists of args.
+        # Note: its not guaranteed that the optimization is always applied
+        # since the queue can be flushed to the browser at any time.
+        # For example:
+        # queue 1:
+        # > empty [0, 0]  <- skipped
+        # > markdown [0, 0]
+        # > empty [1, 0]  <- send to frontend
+        #
+        # queue 2:
+        # > markdown [1, 0]
+        # > ...
+
+        delta_key = tuple(msg.metadata.delta_path)
+        if delta_key in self._delta_index_map:
+            index = self._delta_index_map[delta_key]
+            old_msg = self._queue[index]
+            composed_msg = _maybe_compose_delta_msgs(old_msg, msg)
+            if composed_msg is not None:
+                self._queue[index] = composed_msg
+                return
+
+        # No composition occurred. Append this message to the queue, and
+        # store its index for potential future composition.
+        self._delta_index_map[delta_key] = len(self._queue)
+        self._queue.append(msg)
+
+    def clear(
+        self,
+        retain_lifecycle_msgs: bool = False,
+        fragment_ids_this_run: list[str] | None = None,
+    ) -> None:
+        """Clear the queue, potentially retaining lifecycle messages.
+
+        The retain_lifecycle_msgs argument exists because in some cases (in particular
+        when a currently running script is interrupted by a new BackMsg), we don't want
+        to remove certain messages from the queue as doing so may cause the client to
+        not hear about important script lifecycle events (such as the script being
+        stopped early in order to be rerun).
+
+        If fragment_ids_this_run is provided, delta messages not belonging to any
+        fragment or belonging to a fragment not in fragment_ids_this_run will be
+        preserved to prevent clearing messages unrelated to the running fragments.
+
+        Retained ``script_finished`` messages may be downgraded to
+        ``FINISHED_EARLY_FOR_RERUN`` or annotated with the fragments whose output
+        this clear dropped; see ``_update_script_finished_message``.
+        """
+
+        if not retain_lifecycle_msgs:
+            self._queue = []
+        else:
+            retained: list[ForwardMsg] = []
+            # A run's deltas follow its new_session and precede its
+            # script_finished, so this holds the fragments whose output was
+            # dropped from the run that finishes next.
+            dropped_fragment_ids: set[str] = set()
+            for msg in self._queue:
+                if not _is_retained_on_clear(msg, fragment_ids_this_run):
+                    dropped_fragment_ids.add(msg.delta.fragment_id)
+                    continue
+                if msg.WhichOneof("type") == "new_session":
+                    # Drops collected before this new_session belong to a run
+                    # that was replaced before it sent script_finished, so they
+                    # must not count against the next finish.
+                    dropped_fragment_ids = set()
+                elif msg.WhichOneof("type") == "script_finished":
+                    _update_script_finished_message(
+                        msg,
+                        is_fragment_run=fragment_ids_this_run is not None,
+                        dropped_fragment_ids=dropped_fragment_ids,
+                    )
+                    dropped_fragment_ids = set()
+                retained.append(msg)
+            self._queue = retained
+
+        self._delta_index_map = {}
+
+    def flush(self) -> list[ForwardMsg]:
+        """Clear the queue and return a list of the messages it contained
+        before being cleared.
+        """
+        queue = self._queue
+        self.clear()
+        return queue
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+
+def _is_toast_delta(msg: ForwardMsg) -> bool:
+    """True if the ForwardMsg is a toast element delta.
+
+    Lifecycle-retaining clears keep unflushed toast deltas so that an
+    ``st.toast()`` issued right before ``st.rerun()`` still reaches the browser
+    (issue #7740); see ``ForwardMsgQueue.clear`` for the rationale.
+    """
+    return (
+        msg.HasField("delta")
+        and msg.delta.WhichOneof("type") == "new_element"
+        and msg.delta.new_element.WhichOneof("type") == "toast"
+    )
+
+
+def _is_composable_message(msg: ForwardMsg) -> bool:
+    """True if the ForwardMsg is potentially composable with other ForwardMsgs."""
+    if msg.HasField("ref_hash"):
+        # reference messages (cached in frontend) are always composable.
+        # Only new_element deltas can be reference messages.
+        return True
+
+    if not msg.HasField("delta"):
+        # Non-delta messages are never composable.
+        return False
+
+    # new_transient is the only delta type that must NOT be coalesced, even when
+    # its delta_path matches an existing entry. This is because transient elements
+    # (e.g. spinners) represent temporary UI state that needs to be processed
+    # individually rather than merged with prior deltas at the same path.
+    delta_type = msg.delta.WhichOneof("type")
+    return delta_type != "new_transient"
+
+
+def _maybe_compose_delta_msgs(
+    old_msg: ForwardMsg, new_msg: ForwardMsg
+) -> ForwardMsg | None:
+    """Optimization logic that composes new_msg onto old_msg if possible.
+
+    If the combination takes place, the function returns a new ForwardMsg that
+    should replace old_msg in the queue. This basically means that the old_msg
+    is not send to the browser since its considered unnecessary.
+
+    If the new_msg is incompatible with old_msg, the function returns None.
+    In this case, the new_msg should just be appended to the queue as normal.
+    """
+
+    if old_msg.HasField("delta") and old_msg.delta.WhichOneof("type") == "add_block":
+        # We never replace add_block deltas, because blocks can have
+        # other dependent deltas later in the queue. For example:
+        #
+        # >  placeholder = st.empty()
+        # >  placeholder.columns(1)
+        # >  placeholder.empty()
+        #
+        # The call to "placeholder.columns(1)" creates two blocks, a parent
+        # container with delta_path (0, 0), and a column child with
+        # delta_path (0, 0, 0). If the final "placeholder.empty()" Delta
+        # is composed with the parent container Delta, the frontend will
+        # throw an error when it tries to add that column child to what is
+        # now just an element, and not a block.
+        return None
+
+    if new_msg.HasField("ref_hash"):
+        # ref_hash messages are always composable.
+        # Only new_element deltas can be reference messages.
+        return new_msg
+
+    new_delta_type = new_msg.delta.WhichOneof("type")
+    if new_delta_type in {"new_element", "add_block"}:
+        return new_msg
+
+    return None
+
+
+_LIFECYCLE_MSG_TYPES = frozenset(
+    {
+        "new_session",
+        "script_finished",
+        "session_status_changed",
+        "parent_message",
+        "page_info_changed",
+    }
+)
+
+
+def _is_retained_on_clear(
+    msg: ForwardMsg, fragment_ids_this_run: list[str] | None
+) -> bool:
+    """True if a lifecycle-retaining clear keeps this message in the queue."""
+    if msg.WhichOneof("type") in _LIFECYCLE_MSG_TYPES:
+        return True
+
+    # Toasts are one-shot notifications that must survive the queue clear
+    # happening when a run is interrupted (e.g. st.toast() immediately followed
+    # by st.rerun()); otherwise the toast delta is dropped before it reaches the
+    # browser (issue #7740).
+    if _is_toast_delta(msg):
+        return True
+
+    # A fragment rerun only drops deltas of the fragments it is about to rerun.
+    # Other fragments' deltas are kept, as are main-script deltas and non-delta
+    # messages (their fragment_id is empty).
+    return (
+        fragment_ids_this_run is not None
+        and msg.delta.fragment_id not in fragment_ids_this_run
+    )
+
+
+def _update_script_finished_message(
+    msg: ForwardMsg, *, is_fragment_run: bool, dropped_fragment_ids: set[str]
+) -> None:
+    """Rewrite a retained ``script_finished`` after a lifecycle-retaining clear.
+
+    ``dropped_fragment_ids`` holds the fragments whose deltas this clear dropped
+    from the run that this ``script_finished`` belongs to.
+
+    - A full-app clear downgrades every finish to ``FINISHED_EARLY_FOR_RERUN``,
+      so a stale ``FINISHED_SUCCESSFULLY`` can't reset widget state in the
+      browser.
+    - A fragment clear never changes ``FINISHED_SUCCESSFULLY``.
+    - A fragment clear keeps ``FINISHED_FRAGMENT_RUN_SUCCESSFULLY`` if it dropped
+      nothing from that run, or only output of some of the run's own fragments.
+      Those fragments are listed in ``metadata.delivery``.
+    - Every other finish is downgraded and loses ``delivery``.
+
+    ``metadata.run`` is never rewritten, so it still matches the run's
+    ``new_session``.
+    """
+    status = msg.script_finished
+    if is_fragment_run and status == ForwardMsg.FINISHED_SUCCESSFULLY:
+        # A fragment should not modify the finished status of a full app run,
+        # because the fragment finished state is different and the frontend
+        # might not trigger cleanups etc. correctly.
+        return
+
+    if is_fragment_run and status == ForwardMsg.FINISHED_FRAGMENT_RUN_SUCCESSFULLY:
+        # This run reached its end, and the next run's cleanup only covers the
+        # fragments it reruns. Downgrading would leave elements this run
+        # stopped rendering on screen, so keep the status unless its cleanup
+        # could remove live output that this clear dropped.
+        if not dropped_fragment_ids:
+            return
+        # Dropped output of some of this run's own fragments is replaced by
+        # their next run, so the browser limits cleanup to the other fragments.
+        # The message can be retained by several clears, so earlier drops count.
+        run_fragment_ids = list(msg.metadata.run.fragment_ids)
+        all_dropped_ids = dropped_fragment_ids.union(
+            msg.metadata.delivery.dropped_fragment_ids
+        )
+        if all_dropped_ids < set(run_fragment_ids):
+            msg.metadata.delivery.dropped_fragment_ids[:] = [
+                fragment_id
+                for fragment_id in run_fragment_ids
+                if fragment_id in all_dropped_ids
+            ]
+            return
+
+    msg.script_finished = ForwardMsg.FINISHED_EARLY_FOR_RERUN
+    # An earlier clear may have recorded a partial drop. The browser reads it
+    # on any finish, so a downgraded finish must not narrow widget completion.
+    if msg.metadata.HasField("delivery"):
+        msg.metadata.ClearField("delivery")

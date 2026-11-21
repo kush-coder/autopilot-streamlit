@@ -1,0 +1,2130 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import {
+  darken,
+  getLuminance,
+  lighten,
+  parseToRgba,
+  toHex,
+  transparentize,
+} from "color2k"
+import { cloneDeep, isObject, merge, mergeWith, once } from "lodash-es"
+import { getLogger } from "loglevel"
+
+import { CustomThemeConfig } from "@streamlit/protobuf"
+import { localStorageAvailable, StreamlitConfig } from "@streamlit/utils"
+
+import type { CircularBuffer } from "~lib/components/shared/Profiler/CircularBuffer"
+import { LocalStore } from "~lib/util/storageUtils"
+import {
+  isDarkThemeInQueryParams,
+  isLightThemeInQueryParams,
+  notNullOrUndefined,
+} from "~lib/util/utils"
+
+import { computeDerivedColors, createEmotionColors } from "./getColors"
+import { createShadows } from "./getShadows"
+import { fonts } from "./primitives/typography"
+import { baseTheme, darkTheme, lightTheme } from "./themeConfigs"
+import type {
+  CachedTheme,
+  DerivedColors,
+  EmotionTheme,
+  EmotionThemeColors,
+  ThemeConfig,
+  ThemeSelection,
+  ThemeSpacing,
+} from "./types"
+
+export const AUTO_THEME_NAME = "Use system setting"
+export const CUSTOM_THEME_NAME = "Custom Theme"
+export const CUSTOM_THEME_LIGHT_NAME = "Custom Theme Light"
+export const CUSTOM_THEME_DARK_NAME = "Custom Theme Dark"
+export const CUSTOM_THEME_AUTO_NAME = "Custom Theme Auto"
+
+declare global {
+  interface Window {
+    __streamlit_profiles__?: Record<
+      string,
+      CircularBuffer<{
+        phase: "mount" | "update" | "nested-update"
+        actualDuration: number
+        baseDuration: number
+        startTime: number
+        commitTime: number
+      }>
+    >
+  }
+}
+const LOG = getLogger("theme:utils")
+
+/**
+ * Recursively sorts the theme input keys to ensure consistent theme hashing.
+ * Used in App.tsx createThemeHash method.
+ *
+ * @param obj - The theme input object (or any nested value within it)
+ * @returns The same structure with all object keys sorted alphabetically
+ */
+export function sortThemeInputKeys(obj: unknown): unknown {
+  if (obj === null || obj === undefined) {
+    return obj
+  }
+
+  // Handle arrays by recursively sorting their elements
+  if (Array.isArray(obj)) {
+    return obj.map(item => sortThemeInputKeys(item))
+  }
+
+  // Handle objects (including nested theme sections)
+  if (typeof obj === "object") {
+    const sorted: Record<string, unknown> = {}
+    Object.keys(obj)
+      .toSorted()
+      .forEach(key => {
+        sorted[key] = sortThemeInputKeys((obj as Record<string, unknown>)[key])
+      })
+    return sorted
+  }
+
+  // Return primitives as-is
+  return obj
+}
+
+function mergeTheme(
+  theme: ThemeConfig,
+  injectedTheme: CustomThemeConfig.$Properties | undefined
+): ThemeConfig {
+  // We confirm the injectedTheme is a valid object before merging it
+  // since the type makes assumption about the implementation of the
+  // injected object.
+  if (injectedTheme && isObject(injectedTheme)) {
+    const themeConfigProto = new CustomThemeConfig(injectedTheme)
+    // eslint-disable-next-line @typescript-eslint/no-use-before-define
+    return createTheme(theme.name, themeConfigProto, theme)
+  }
+
+  return theme
+}
+
+export const getMergedLightTheme = once(() =>
+  mergeTheme(lightTheme, StreamlitConfig.LIGHT_THEME)
+)
+export const getMergedDarkTheme = once(() =>
+  mergeTheme(darkTheme, StreamlitConfig.DARK_THEME)
+)
+
+export const getSystemThemePreference = (): "light" | "dark" => {
+  const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches
+
+  return prefersDark ? "dark" : "light"
+}
+
+export const getSystemTheme = (): ThemeConfig => {
+  return getSystemThemePreference() === "dark"
+    ? getMergedDarkTheme()
+    : getMergedLightTheme()
+}
+
+export const createAutoTheme = (): ThemeConfig => ({
+  ...getSystemTheme(),
+  name: AUTO_THEME_NAME,
+})
+
+// Update auto theme in case it has changed
+export const createPresetThemes = (): ThemeConfig[] => [
+  createAutoTheme(),
+  getMergedLightTheme(),
+  getMergedDarkTheme(),
+]
+
+export const isPresetTheme = (themeConfig: ThemeConfig): boolean => {
+  const presetThemeNames = createPresetThemes().map((t: ThemeConfig) => t.name)
+  return presetThemeNames.includes(themeConfig.name)
+}
+
+export const bgColorToBaseString = (bgColor?: string): string =>
+  bgColor === undefined || getLuminance(bgColor) > 0.5 ? "light" : "dark"
+
+export const isColor = (strColor: string): boolean => {
+  const s = new Option().style
+  s.color = strColor
+  return s.color !== ""
+}
+
+/**
+ * Helper function that rounds a font size (in rem) to the nearest eighth of a rem
+ * This is used to keep configured font sizes to (generally) round values for dialogs.
+ * See `convertFontSizes` in `StreamlitMarkdown/styled-components.ts`
+ * (ex: 0.78 -> 0.75)
+ */
+export const roundFontSizeToNearestEighth = (remFontSize: number): number => {
+  return Math.round(remFontSize * 8) / 8
+}
+
+export const parseFont = (
+  font: string,
+  // fallbackFont is the default streamlit font to use if the custom font fails to load
+  fallbackFont: string = fonts.sansSerif
+): string => {
+  // Handle empty/whitespace-only input
+  const trimmedFont = font.trim()
+  if (!trimmedFont) {
+    return fallbackFont
+  }
+
+  // Try to map a short font family to our default
+  // font families
+  const fontMap: Record<string, string> = {
+    "sans-serif": fonts.sansSerif,
+    serif: fonts.serif,
+    monospace: fonts.monospace,
+  }
+  // The old font config supported "sans serif" as a font family, but this
+  // isn't a valid font family, so we need to support it by converting it to
+  // "sans-serif".
+  const fontKey = trimmedFont.toLowerCase().replaceAll(" ", "-")
+  if (fontKey in fontMap) {
+    return fontMap[fontKey]
+  }
+
+  // Always append Streamlit's default font as the final fallback, ensuring
+  // that if custom fonts fail to load (including any user-specified fallbacks),
+  // Streamlit's default fonts are used instead of the browser's defaults.
+  // Note: This may result in redundant generic families if the user's font string
+  // already includes one (ex: "Arial, sans-serif, "Source Sans", sans-serif").
+  // This is intentional - it's valid CSS and ensures appropriate fallback behavior.
+  return `${trimmedFont}, ${fallbackFont}`
+}
+
+/**
+ * Helper function to parse/validate a config color value
+ * @param color: a theme field value that may be a color string
+ * @param configKey: a string - the config that the color value was passed for
+ * @param inSidebar: boolean - whether this is for sidebar theming (for error messages)
+ * @returns the validated color value, or undefined if blank/unset or invalid
+ */
+const parseColor = (
+  color: unknown,
+  configKey: string,
+  inSidebar: boolean = false
+): string | undefined => {
+  // Blank and whitespace-only strings are unset (proto3's default is "").
+  // Non-strings, such as nested theme sections, are not colors.
+  if (typeof color !== "string" || !color.trim()) {
+    return undefined
+  }
+
+  // First try the color as-is
+  if (isColor(color)) {
+    return color
+  }
+
+  // If that fails, try adding a # prefix
+  if (isColor(`#${color}`)) {
+    return `#${color}`
+  }
+
+  // If both fail and this is a color config, log a warning
+  const isAColorConfig = configKey.toLowerCase().includes("color")
+  if (isAColorConfig) {
+    const themeSection = inSidebar ? "theme.sidebar" : "theme"
+    LOG.warn(
+      `Invalid color passed for ${configKey} in ${themeSection}: "${color}"`
+    )
+  }
+
+  return undefined
+}
+
+/**
+ * Normalize a color for hex equality checks. Accepts hashless hex the same way
+ * `parseColor` does. Returns undefined for invalid colors instead of throwing.
+ */
+const toComparableHex = (color: string): string | undefined => {
+  const normalized = isColor(color)
+    ? color
+    : isColor(`#${color}`)
+      ? `#${color}`
+      : undefined
+  if (normalized === undefined) {
+    return undefined
+  }
+  try {
+    return toHex(normalized)
+  } catch {
+    return undefined
+  }
+}
+
+const colorsMatchAsHex = (a: string, b: string): boolean => {
+  const aHex = toComparableHex(a)
+  const bHex = toComparableHex(b)
+  return aHex !== undefined && bHex !== undefined && aHex === bHex
+}
+
+/**
+ * First non-blank color that parses (hashless hex allowed). Blank or invalid
+ * values are treated as unset so they cannot suppress stock chrome fallbacks.
+ */
+const firstConfiguredColor = (
+  ...colors: Array<string | null | undefined>
+): string | undefined => {
+  for (const color of colors) {
+    if (color && toComparableHex(color) !== undefined) {
+      return color
+    }
+  }
+  return undefined
+}
+
+/**
+ * Helper function for theme background colors
+ * If the background color is configured, use it.
+ * If the main color is configured, derive background color from it.
+ * If neither is configured, fallback to default.
+ */
+const resolveBgColor = (
+  configBackgroundColor: string | undefined,
+  configMainColor: string | undefined,
+  defaultBackgroundColor: string,
+  isLightTheme: boolean
+): string => {
+  if (configBackgroundColor) return configBackgroundColor
+  if (configMainColor) {
+    const transparency = isLightTheme ? 0.9 : 0.8
+    return transparentize(configMainColor, transparency)
+  }
+  return defaultBackgroundColor
+}
+
+/**
+ * Helper function for theme text colors
+ * If the text color is configured, use it.
+ * If the main color is configured, derive text color from it.
+ * If neither is configured, fallback to default.
+ */
+const resolveTextColor = (
+  configTextColor: string | undefined,
+  configMainColor: string | undefined,
+  defaultTextColor: string,
+  isLightTheme: boolean
+): string => {
+  if (configTextColor) return configTextColor
+  if (configMainColor) {
+    const adjustmentAmount = 0.15
+    return isLightTheme
+      ? darken(configMainColor, adjustmentAmount)
+      : lighten(configMainColor, adjustmentAmount)
+  }
+  return defaultTextColor
+}
+
+/**
+ * Applies background color overrides to theme colors using smart fallback logic.
+ * For each background color: uses explicit config if provided, derives from main color if available,
+ * or falls back to default.
+ * @param existingColors - The existing emotion theme colors object
+ * @param parsedColors - All parsed color configurations from user input
+ * @returns Updated emotion theme colors object with background colors applied
+ */
+const setBackgroundColors = (
+  existingColors: EmotionThemeColors,
+  parsedColors: Record<string, string | undefined>
+): EmotionThemeColors => {
+  const updatedColors = {
+    ...existingColors,
+  }
+  const backgroundColorMap = {
+    redBackgroundColor: {
+      main: parsedColors.redColor,
+      background: parsedColors.redBackgroundColor,
+    },
+    orangeBackgroundColor: {
+      main: parsedColors.orangeColor,
+      background: parsedColors.orangeBackgroundColor,
+    },
+    yellowBackgroundColor: {
+      main: parsedColors.yellowColor,
+      background: parsedColors.yellowBackgroundColor,
+    },
+    blueBackgroundColor: {
+      main: parsedColors.blueColor,
+      background: parsedColors.blueBackgroundColor,
+    },
+    greenBackgroundColor: {
+      main: parsedColors.greenColor,
+      background: parsedColors.greenBackgroundColor,
+    },
+    violetBackgroundColor: {
+      main: parsedColors.violetColor,
+      background: parsedColors.violetBackgroundColor,
+    },
+    grayBackgroundColor: {
+      main: parsedColors.grayColor,
+      background: parsedColors.grayBackgroundColor,
+    },
+  }
+
+  const isLightTheme = getLuminance(updatedColors.bgColor) > 0.5
+
+  Object.entries(backgroundColorMap).forEach(([key, { main, background }]) => {
+    const typedKey = key as keyof typeof backgroundColorMap
+    updatedColors[typedKey] = resolveBgColor(
+      background,
+      main,
+      existingColors[typedKey],
+      isLightTheme
+    )
+  })
+
+  return updatedColors
+}
+
+/**
+ * Applies text color overrides to theme colors using smart fallback logic.
+ * For each text color: uses explicit config if provided, derives from main color if available,
+ * or falls back to default.
+ * @param existingColors - The existing emotion theme colors object
+ * @param parsedColors - All parsed color configurations from user input
+ * @returns Updated emotion theme colors object with text colors applied
+ */
+const setTextColors = (
+  existingColors: EmotionThemeColors,
+  parsedColors: Record<string, string | undefined>
+): EmotionThemeColors => {
+  const updatedColors = {
+    ...existingColors,
+  }
+  const textColorMap = {
+    redTextColor: {
+      main: parsedColors.redColor,
+      text: parsedColors.redTextColor,
+    },
+    orangeTextColor: {
+      main: parsedColors.orangeColor,
+      text: parsedColors.orangeTextColor,
+    },
+    yellowTextColor: {
+      main: parsedColors.yellowColor,
+      text: parsedColors.yellowTextColor,
+    },
+    blueTextColor: {
+      main: parsedColors.blueColor,
+      text: parsedColors.blueTextColor,
+    },
+    greenTextColor: {
+      main: parsedColors.greenColor,
+      text: parsedColors.greenTextColor,
+    },
+    violetTextColor: {
+      main: parsedColors.violetColor,
+      text: parsedColors.violetTextColor,
+    },
+    grayTextColor: {
+      main: parsedColors.grayColor,
+      text: parsedColors.grayTextColor,
+    },
+  }
+
+  const isLightTheme = getLuminance(updatedColors.bgColor) > 0.5
+
+  Object.entries(textColorMap).forEach(([key, { main, text }]) => {
+    const typedKey = key as keyof typeof textColorMap
+    updatedColors[typedKey] = resolveTextColor(
+      text,
+      main,
+      existingColors[typedKey],
+      isLightTheme
+    )
+  })
+
+  return updatedColors
+}
+
+/**
+ * Helper function to parse the baseRadius & buttonRadius options which allow the same possible values
+ * @param radius: a string - "none", "small", "medium", "large", "full", a number in pixels or rem
+ * @returns radius value and css unit
+ */
+export const parseRadius = (
+  radius: string
+): [number | undefined, "px" | "rem"] => {
+  let cssUnit: "px" | "rem" = "rem"
+  let radiusValue: number | undefined = undefined
+  const processedRadius = radius.trim().toLowerCase()
+
+  if (processedRadius === "none") {
+    radiusValue = 0
+  } else if (processedRadius === "small") {
+    radiusValue = 0.35
+  } else if (processedRadius === "medium") {
+    radiusValue = 0.5
+  } else if (processedRadius === "large") {
+    radiusValue = 1
+  } else if (processedRadius === "full") {
+    radiusValue = 1.4
+  } else if (processedRadius.endsWith("rem")) {
+    radiusValue = Number.parseFloat(processedRadius)
+  } else if (processedRadius.endsWith("px")) {
+    radiusValue = Number.parseFloat(processedRadius)
+    cssUnit = "px"
+  } else if (!Number.isNaN(Number.parseFloat(processedRadius))) {
+    // Fallback: if the value can be parsed as a number, treat it as pixels
+    radiusValue = Number.parseFloat(processedRadius)
+    cssUnit = "px"
+  }
+
+  return [radiusValue, cssUnit]
+}
+
+/**
+ * Helper function to parse fontSize options which allow the same possible values
+ * @param fontSize a string number in pixels or rem; handles number values as pixels
+ * (e.g. "15px", "0.875rem", "15")
+ * @returns font size in em (e.g. "0.875em")
+ */
+export const parseFontSize = (
+  configName: string,
+  fontSize: string | number,
+  inSidebar: boolean
+): string | undefined => {
+  const themeSection = inSidebar ? "theme.sidebar" : "theme"
+
+  if (typeof fontSize === "string") {
+    // If string, check its valid (ends with "rem" or "px")
+    // and can be parsed as a number
+    const processedFontSize = fontSize.trim().toLowerCase()
+    const parsedFontSize = Number.parseFloat(processedFontSize)
+    if (
+      parsedFontSize &&
+      (processedFontSize.endsWith("rem") || processedFontSize.endsWith("px"))
+    ) {
+      return processedFontSize
+    }
+
+    // Fallback: if the value can be parsed as a number, treat it as pixels
+    if (parsedFontSize.toString() === processedFontSize) {
+      return `${processedFontSize}px`
+    }
+  }
+  // If invalid, log warning and return undefined
+  LOG.warn(
+    `Invalid size passed for ${configName} in ${themeSection}: ${fontSize}. Falling back to default ${configName}.`
+  )
+  return undefined
+}
+
+/**
+ * Parses a `paddingTop` or `paddingBottom` theme config value.
+ *
+ * Accepted formats (non-negative):
+ *  - `"1.5rem"` / `"16px"` — returned as a normalized `rem` or `px` string.
+ *  - `"16"` (bare number string) — treated as pixels, returned as `"16px"`.
+ *  - `"0"`, `"0rem"`, `"0px"` — all valid; returned as `"0px"` / `"0rem"`.
+ *
+ * Values are normalized through `Number()`, so `"1.50rem"` becomes `"1.5rem"`
+ * and `"1e1px"` becomes `"10px"`.
+ *
+ * Rejected: negative values, non-finite numbers, `%`, `vh`, `vw`, `calc()`,
+ * and other CSS units. On rejection, logs a warning and returns `undefined`
+ * so the caller keeps the built-in spacing.
+ *
+ * @param configName - The config key name, used in the warning message.
+ * @param value - The raw config string to validate. Host theme payloads may
+ *   send a non-string; those warn and fall back like invalid strings.
+ * @param inSidebar - When true, the warning message cites "theme.sidebar".
+ * @returns The normalised CSS length string, or `undefined` if invalid.
+ */
+export const parsePadding = (
+  configName: string,
+  value: string | null | undefined | number | boolean,
+  inSidebar: boolean
+): string | undefined => {
+  if (!notNullOrUndefined(value)) {
+    return undefined
+  }
+
+  const themeSection = inSidebar ? "theme.sidebar" : "theme"
+
+  // Host SET_CUSTOM_THEME_CONFIG can deliver a bare number; do not call trim().
+  if (typeof value !== "string") {
+    LOG.warn(
+      `Invalid ${configName} in ${themeSection}: ${String(value)}. Use a quoted rem or px value. Falling back to default.`
+    )
+    return undefined
+  }
+
+  const trimmed = value.trim().toLowerCase()
+
+  // Only allow rem and px units (or unitless numbers → treated as px)
+  const hasRemUnit = trimmed.endsWith("rem")
+  const hasPxUnit = trimmed.endsWith("px")
+
+  let numericStr: string
+  if (hasRemUnit) {
+    numericStr = trimmed.slice(0, -3)
+  } else if (hasPxUnit) {
+    numericStr = trimmed.slice(0, -2)
+  } else {
+    // Must be a bare number (no unit)
+    numericStr = trimmed
+  }
+
+  const numericValue = Number(numericStr)
+
+  if (!Number.isFinite(numericValue) || numericStr === "") {
+    LOG.warn(
+      `Invalid ${configName} in ${themeSection}: "${value}". Only rem or px values are allowed (e.g. "1.5rem", "24px"). Falling back to default.`
+    )
+    return undefined
+  }
+
+  if (numericValue < 0) {
+    LOG.warn(
+      `Invalid ${configName} in ${themeSection}: "${value}". Negative values are not allowed. Falling back to default.`
+    )
+    return undefined
+  }
+
+  if (hasRemUnit) {
+    return `${numericValue}rem`
+  }
+  // px or unitless — return as px
+  return `${numericValue}px`
+}
+
+/**
+ * Validates a font weight config value against three rules:
+ *   1. Must be an integer.
+ *   2. Must be an integer multiple of 50.
+ *   3. Must be within [`minWeight`, `maxWeight`] (inclusive).
+ *
+ * @param weightConfigName - Name of the config option, used in the warning message.
+ * @param fontWeight - The value to validate; null/undefined means "not configured".
+ * @param minWeight - Lower bound (inclusive).
+ * @param maxWeight - Upper bound (inclusive).
+ * @param inSidebar - When true, the warning message cites "theme.sidebar" instead of "theme".
+ * @returns `true` if the value is set and passes all three rules.
+ *   Returns `false` and logs a warning when the value is set but fails any rule.
+ *   Returns `false` silently when the value is null or undefined.
+ */
+const isValidFontWeight = (
+  weightConfigName: string,
+  fontWeight: number | null | undefined,
+  minWeight: number,
+  maxWeight: number,
+  inSidebar = false
+): boolean => {
+  const themeSection = inSidebar ? "theme.sidebar" : "theme"
+
+  // If the font weight config is set, validate it (log warning if invalid)
+  if (notNullOrUndefined(fontWeight)) {
+    const isInteger = Number.isInteger(fontWeight)
+    const isIncrementOf50 = fontWeight % 50 === 0
+    const isInRange = fontWeight >= minWeight && fontWeight <= maxWeight
+
+    if (!isInteger || !isIncrementOf50 || !isInRange) {
+      LOG.warn(
+        `Invalid ${weightConfigName}: ${fontWeight} in ${themeSection}. The ${weightConfigName} must be an integer ${minWeight}-${maxWeight}, and an increment of 50. Falling back to default font weight.`
+      )
+      return false
+    }
+
+    return true
+  }
+
+  // If the font weight config is not set, return false
+  return false
+}
+
+/**
+ * Helper function to handle each heading font size in the headingFontSizes config
+ * @param configName: the name of the config option
+ * @param fontSize: the heading font size provided via theme config
+ * @param baseFontSize: the base font size (default or provided via theme config)
+ * @param inSidebar: whether this is the sidebar theme
+ * @returns the heading font size in rem
+ */
+const convertHeadingFontSizeToRem = (
+  configName: string,
+  fontSize: string,
+  baseFontSize: number,
+  inSidebar: boolean
+): string | undefined => {
+  // Validates the font size (logs warning & returns undefined if invalid)
+  const validatedSize = parseFontSize(configName, fontSize, inSidebar)
+
+  // Need each heading font size to be in rem
+  if (validatedSize?.endsWith("rem") === true) {
+    return validatedSize
+  } else if (validatedSize?.endsWith("px") === true) {
+    // Convert the font size to rem, and round to nearest 8th
+    const remValue = Number.parseFloat(validatedSize) / baseFontSize
+    return `${remValue}rem`
+  }
+
+  // If invalid, return undefined
+  return undefined
+}
+
+/**
+ * Set the heading font sizes in the theme config
+ * @param defaultFontSizes: the default theme font sizes
+ * @param inSidebar: whether this is the sidebar theme
+ * @param baseFontSize: the base font size (default or provided via theme config)
+ * @param headingFontSizes: the h1-h6 heading font sizes provided via theme config
+ * @returns an updated emotion theme font sizes object
+ */
+const setHeadingFontSizes = (
+  defaultFontSizes: EmotionTheme["fontSizes"],
+  inSidebar: boolean,
+  baseFontSize: number,
+  headingFontSizes: string[] | null | undefined
+): EmotionTheme["fontSizes"] => {
+  const headingFontSizesOverrides = {
+    ...defaultFontSizes,
+  }
+
+  if (headingFontSizes) {
+    headingFontSizes.forEach((size, index) => {
+      const headingFontSizeKey = `h${index + 1}FontSize`
+      // Gets the heading font size in rem if not already & logs warning if invalid
+      const convertedSize = convertHeadingFontSizeToRem(
+        `${headingFontSizeKey} in headingFontSizes`,
+        size,
+        baseFontSize,
+        inSidebar
+      )
+
+      // If valid configured value, overwrite the default heading font size
+      if (convertedSize) {
+        // Computed h1-h6 key is a plain string.
+        // @ts-expect-error - font sizes have no index signature
+        headingFontSizesOverrides[headingFontSizeKey] = convertedSize
+      }
+    })
+  }
+
+  return headingFontSizesOverrides
+}
+
+/**
+ * Helper function to set the normal, bold, and extrabold font weights based
+ * on the baseFontWeight option
+ * @param defaultFontWeights: the default theme font weights
+ * @param inSidebar: whether the theme is in the sidebar
+ * @param baseFontWeight: the base font weight provided via theme config
+ * @param codeFontWeight: the code font weight provided via theme config
+ * @param headingFontWeights: the h1-h6 heading font weights provided via theme config
+ * @returns an updated emotion theme font weights object
+ */
+const setFontWeights = (
+  defaultFontWeights: EmotionTheme["fontWeights"],
+  inSidebar: boolean,
+  baseFontWeight: number | null | undefined,
+  codeFontWeight: number | null | undefined,
+  headingFontWeights: number[] | null | undefined
+): EmotionTheme["fontWeights"] => {
+  const fontWeightOverrides = {
+    ...defaultFontWeights,
+    // Override default h1FontWeight for sidebar to 600
+    // Default for main theme set in typography (700)
+    h1FontWeight: inSidebar ? 600 : defaultFontWeights.h1FontWeight,
+  }
+
+  // Validate the baseFontWeight provided is an integer between 100 and 600
+  if (
+    baseFontWeight &&
+    isValidFontWeight("baseFontWeight", baseFontWeight, 100, 600)
+  ) {
+    // Set each of the font weights based on the base weight provided
+    // The provided baseFontWeight sets the normal weight
+    fontWeightOverrides.normal = baseFontWeight
+    // The semiBold weight is set to the baseFontWeight + 100
+    fontWeightOverrides.semiBold = baseFontWeight + 100
+    // The bold weight is set to the baseFontWeight + 200
+    fontWeightOverrides.bold = baseFontWeight + 200
+    // The extrabold weight is set to the baseFontWeight + 300
+    fontWeightOverrides.extrabold = baseFontWeight + 300
+
+    // Set fallback for code font weights based on configured baseFontWeight
+    fontWeightOverrides.code = baseFontWeight
+    fontWeightOverrides.codeBold = baseFontWeight + 200
+    fontWeightOverrides.codeExtraBold = baseFontWeight + 300
+  }
+
+  if (
+    codeFontWeight &&
+    isValidFontWeight("codeFontWeight", codeFontWeight, 100, 600)
+  ) {
+    // Set each of the code weights based on the base code font weight provided
+    fontWeightOverrides.code = codeFontWeight
+    // The bold weight is set to the codeFontWeight + 200
+    fontWeightOverrides.codeBold = codeFontWeight + 200
+    // The extrabold weight is set to the codeFontWeight + 300
+    fontWeightOverrides.codeExtraBold = codeFontWeight + 300
+  }
+
+  if (headingFontWeights) {
+    // Filling out the heading font weights array is handled in app_session.py
+    headingFontWeights.forEach((weight, index) => {
+      const headingFontWeightKey = `h${index + 1}FontWeight`
+      if (
+        isValidFontWeight(
+          `${headingFontWeightKey} in headingFontWeights`,
+          weight,
+          100,
+          900,
+          inSidebar
+        )
+      ) {
+        // Computed h1-h6 key is a plain string.
+        // @ts-expect-error - font weights have no index signature
+        fontWeightOverrides[headingFontWeightKey] = weight
+      }
+    })
+  }
+
+  return fontWeightOverrides
+}
+
+/**
+ * Helper function to validate each of the colors passed in the chart colors configs
+ * @param configName: the name of the config ("chartCategoricalColors", "chartSequentialColors" or "chartDivergingColors")
+ * @param colors: the colors config passed in (array of strings)
+ * @returns the valid colors from the config
+ */
+const validateChartColors = (
+  configName: string,
+  colors: string[]
+): string[] => {
+  return (
+    colors
+      // parseColor returns undefined for invalid colors
+      .map(color => parseColor(color, configName))
+      // Filter any invalid colors
+      .filter((color): color is string => color !== undefined)
+  )
+}
+
+export const createEmotionTheme = (
+  themeInput: Partial<CustomThemeConfig.$Properties>,
+  baseThemeConfig = baseTheme
+): EmotionTheme => {
+  const { colors, genericFonts, inSidebar } = baseThemeConfig.emotion
+  const {
+    baseFontSize,
+    baseFontWeight,
+    baseRadius,
+    buttonRadius,
+    codeFontSize,
+    codeFontWeight,
+    showWidgetBorder,
+    headingFont,
+    headingFontSizes,
+    headingFontWeights,
+    bodyFont,
+    codeFont,
+    showSidebarBorder,
+    linkUnderline,
+    // Since chart color configs passed as array, handle separate from parsedColors
+    chartCategoricalColors,
+    chartSequentialColors,
+    chartDivergingColors,
+    // Metric value styling
+    metricValueFontSize,
+    metricValueFontWeight,
+    // Page content padding
+    paddingTop,
+    paddingBottom,
+    ...customColors
+  } = themeInput
+
+  const parsedColors = Object.entries(customColors).reduce(
+    // parseColor drops unset or invalid colors, so a lookup can return undefined.
+    (colorsArg: Partial<Record<string, string>>, [key, color]) => {
+      const validatedColor = parseColor(color, key, inSidebar)
+      if (validatedColor) {
+        colorsArg[key] = validatedColor
+      }
+
+      return colorsArg
+    },
+    {}
+  )
+
+  // Extract configured color values from parsedColors and map them to the correct theme color primitive
+  const {
+    secondaryBackgroundColor: secondaryBg,
+    backgroundColor: bgColor,
+    primaryColor: primary,
+    textColor: bodyText,
+    dataframeBorderColor,
+    dataframeHeaderBackgroundColor,
+    dataframeHeaderTextColor,
+    borderColor,
+    linkColor,
+    codeTextColor,
+    codeBackgroundColor,
+    redColor,
+    orangeColor,
+    yellowColor,
+    blueColor,
+    greenColor,
+    violetColor,
+    grayColor,
+  } = parsedColors
+
+  // Create a new generic colors object with configured colors, if they exist.
+  // Fallback to the default colors if they are not set. Necessary as createEmotionColors
+  // calculates some colors based on the generic colors.
+  const newGenericColors = {
+    ...colors,
+    primary: primary ?? colors.primary,
+    bodyText: bodyText ?? colors.bodyText,
+    secondaryBg: secondaryBg ?? colors.secondaryBg,
+    bgColor: bgColor ?? colors.bgColor,
+    // Main theme colors
+    redColor: redColor ?? colors.redColor,
+    orangeColor: orangeColor ?? colors.orangeColor,
+    yellowColor: yellowColor ?? colors.yellowColor,
+    blueColor: blueColor ?? colors.blueColor,
+    greenColor: greenColor ?? colors.greenColor,
+    violetColor: violetColor ?? colors.violetColor,
+    grayColor: grayColor ?? colors.grayColor,
+    // Secondary color is not yet configurable. Set secondary color to primary color
+    // by default for all custom themes.
+    secondary: primary ?? colors.primary,
+  }
+
+  type ConditionalOverrides = {
+    colors: ReturnType<typeof createEmotionColors>
+    showSidebarBorder: boolean
+    linkUnderline: boolean
+    radii: EmotionTheme["radii"]
+    fontSizes: EmotionTheme["fontSizes"]
+    fontWeights: EmotionTheme["fontWeights"]
+    paddingTop: string | undefined
+    paddingBottom: string | undefined
+  }
+
+  const conditionalOverrides: ConditionalOverrides = {
+    colors: {
+      ...createEmotionColors(newGenericColors),
+    },
+    showSidebarBorder:
+      showSidebarBorder ?? baseThemeConfig.emotion.showSidebarBorder,
+    linkUnderline: linkUnderline ?? baseThemeConfig.emotion.linkUnderline,
+    // Copy over the default values for the other configurable theme properties
+    radii: { ...baseThemeConfig.emotion.radii },
+    fontSizes: { ...baseThemeConfig.emotion.fontSizes },
+    fontWeights: { ...baseThemeConfig.emotion.fontWeights },
+    // Page content padding: parsed below. Undefined keeps the built-in spacing.
+    paddingTop: baseThemeConfig.emotion.paddingTop,
+    paddingBottom: baseThemeConfig.emotion.paddingBottom,
+  }
+
+  // Conditional Overrides - Colors
+
+  // Built-in themes keep the opaque chrome from themeColors.ts. A custom theme
+  // whose backgroundColor, secondaryBackgroundColor, or primaryColor differs
+  // from the base palette derives unset chrome from its own surfaces instead.
+  //
+  // Compare values, not presence: createTheme fills every theme input with the
+  // base primary/background colors, so presence alone is always true.
+  // textColor alone does not trigger derivation.
+  const shouldDeriveUnsetChrome =
+    (notNullOrUndefined(bgColor) &&
+      !colorsMatchAsHex(bgColor, colors.bgColor)) ||
+    (notNullOrUndefined(secondaryBg) &&
+      !colorsMatchAsHex(secondaryBg, colors.secondaryBg)) ||
+    (notNullOrUndefined(primary) && !colorsMatchAsHex(primary, colors.primary))
+
+  if (shouldDeriveUnsetChrome) {
+    if (!notNullOrUndefined(borderColor)) {
+      conditionalOverrides.colors.borderColor =
+        conditionalOverrides.colors.fadedText10
+      conditionalOverrides.colors.borderColorLight =
+        conditionalOverrides.colors.fadedText05
+      if (!notNullOrUndefined(dataframeBorderColor)) {
+        conditionalOverrides.colors.dataframeBorderColor =
+          conditionalOverrides.colors.fadedText05
+      }
+    }
+    if (!notNullOrUndefined(codeBackgroundColor)) {
+      conditionalOverrides.colors.codeBackgroundColor =
+        conditionalOverrides.colors.bgMix
+    }
+    if (!notNullOrUndefined(dataframeHeaderBackgroundColor)) {
+      conditionalOverrides.colors.dataframeHeaderBackgroundColor =
+        conditionalOverrides.colors.bgMix
+    }
+  }
+
+  // Configured code/header chrome wins over both stock and derived defaults.
+  conditionalOverrides.colors.codeBackgroundColor =
+    codeBackgroundColor ?? conditionalOverrides.colors.codeBackgroundColor
+
+  conditionalOverrides.colors.dataframeHeaderBackgroundColor =
+    dataframeHeaderBackgroundColor ??
+    conditionalOverrides.colors.dataframeHeaderBackgroundColor
+
+  // Use the configured header text color when set. Otherwise keep the
+  // fadedText70 default from createEmotionColors (which already tracks
+  // textColor).
+  conditionalOverrides.colors.dataframeHeaderTextColor =
+    dataframeHeaderTextColor ??
+    conditionalOverrides.colors.dataframeHeaderTextColor
+
+  if (notNullOrUndefined(borderColor)) {
+    conditionalOverrides.colors.borderColor = borderColor
+
+    const borderColorLight = transparentize(borderColor, 0.55)
+    // Used for tabs border and expander when stale
+    conditionalOverrides.colors.borderColorLight = borderColorLight
+    // An author-set borderColor drives an unset dataframeBorderColor via the
+    // lighter variant; stock themes keep their own opaque dataframe border.
+    if (!notNullOrUndefined(dataframeBorderColor)) {
+      conditionalOverrides.colors.dataframeBorderColor = borderColorLight
+    }
+  }
+
+  if (notNullOrUndefined(dataframeBorderColor)) {
+    // If dataframeBorderColor explicitly set, override borderColor fallback
+    conditionalOverrides.colors.dataframeBorderColor = dataframeBorderColor
+  }
+
+  if (showWidgetBorder === false) {
+    // Explicit off clears stock widgetBorderColor inherited from the base theme.
+    delete conditionalOverrides.colors.widgetBorderColor
+  } else {
+    // Unset or true: paint widget borders with the resolved borderColor.
+    conditionalOverrides.colors.widgetBorderColor =
+      conditionalOverrides.colors.borderColor
+  }
+
+  // Apply background color overrides based on configured background color or main color as fallback
+  conditionalOverrides.colors = setBackgroundColors(
+    conditionalOverrides.colors,
+    parsedColors
+  )
+
+  // Apply text color overrides based on configured text color or main color as fallback
+  conditionalOverrides.colors = setTextColors(
+    conditionalOverrides.colors,
+    parsedColors
+  )
+
+  // Link color should use the linkColor config if provided, otherwise
+  // use blueTextColor (configured/derived or default) handled above
+  conditionalOverrides.colors.link =
+    linkColor ?? conditionalOverrides.colors.blueTextColor
+
+  // Unset codeTextColor: derived themes follow greenTextColor; otherwise use
+  // body text so textColor-only themes stay ink-aligned without retinting
+  // borders/fills.
+  if (notNullOrUndefined(codeTextColor)) {
+    conditionalOverrides.colors.codeTextColor = codeTextColor
+  } else {
+    conditionalOverrides.colors.codeTextColor = shouldDeriveUnsetChrome
+      ? conditionalOverrides.colors.greenTextColor
+      : conditionalOverrides.colors.bodyText
+  }
+
+  if (
+    notNullOrUndefined(chartCategoricalColors) &&
+    chartCategoricalColors.length > 0
+  ) {
+    // Validate the categorical colors config
+    const validatedCategoricalColors = validateChartColors(
+      "chartCategoricalColors",
+      chartCategoricalColors
+    )
+    // Set the validated colors if non-empty array
+    if (validatedCategoricalColors.length > 0) {
+      conditionalOverrides.colors.chartCategoricalColors =
+        validatedCategoricalColors
+    }
+  }
+
+  if (
+    notNullOrUndefined(chartSequentialColors) &&
+    chartSequentialColors.length > 0
+  ) {
+    // Validate the sequential colors config
+    const validatedSequentialColors = validateChartColors(
+      "chartSequentialColors",
+      chartSequentialColors
+    )
+    // Set the validated colors, sequential colors should be an array of length 10
+    // Also checked on BE, but check here again in case one of the entries is not a valid color
+    if (validatedSequentialColors.length === 10) {
+      conditionalOverrides.colors.chartSequentialColors =
+        validatedSequentialColors
+    } else {
+      LOG.warn(
+        `Invalid chartSequentialColors: ${chartSequentialColors.toString()}. Falling back to default chartSequentialColors.`
+      )
+    }
+  }
+
+  if (
+    notNullOrUndefined(chartDivergingColors) &&
+    chartDivergingColors.length > 0
+  ) {
+    // Validate the diverging colors config
+    const validatedDivergingColors = validateChartColors(
+      "chartDivergingColors",
+      chartDivergingColors
+    )
+    // Set the validated colors, diverging colors should be an array of length 10
+    // Also checked on BE, but check here again in case one of the entries is not a valid color
+    if (validatedDivergingColors.length === 10) {
+      conditionalOverrides.colors.chartDivergingColors =
+        validatedDivergingColors
+    } else {
+      LOG.warn(
+        `Invalid chartDivergingColors: ${chartDivergingColors.toString()}. Falling back to default chartDivergingColors.`
+      )
+    }
+  }
+
+  // Conditional Overrides - Radii
+
+  if (notNullOrUndefined(baseRadius)) {
+    const [radiusValue, cssUnit] = parseRadius(baseRadius)
+
+    if (notNullOrUndefined(radiusValue) && !Number.isNaN(radiusValue)) {
+      const radiusWithCssUnit = addCssUnit(radiusValue, cssUnit)
+      conditionalOverrides.radii.default = radiusWithCssUnit
+
+      // Set the fallback button radius if baseRadius is set
+      conditionalOverrides.radii.button = radiusWithCssUnit
+
+      // Adapt all the other radii sizes based on the base radii:
+      // We make sure that the value is rounded to 2 decimal places to avoid
+      // floating point precision issues.
+      conditionalOverrides.radii.sm = addCssUnit(
+        roundToTwoDecimals(radiusValue * 0.5),
+        cssUnit
+      )
+      conditionalOverrides.radii.md2 = addCssUnit(
+        roundToTwoDecimals(radiusValue * 0.75),
+        cssUnit
+      )
+      conditionalOverrides.radii.xl = addCssUnit(
+        roundToTwoDecimals(radiusValue * 1.5),
+        cssUnit
+      )
+      conditionalOverrides.radii.xxl = addCssUnit(
+        roundToTwoDecimals(radiusValue * 2),
+        cssUnit
+      )
+    } else {
+      LOG.warn(
+        `Invalid base radius: ${baseRadius}. Falling back to default base radius.`
+      )
+    }
+  }
+
+  if (notNullOrUndefined(buttonRadius)) {
+    const [radiusValue, cssUnit] = parseRadius(buttonRadius)
+
+    if (notNullOrUndefined(radiusValue) && !Number.isNaN(radiusValue)) {
+      // If valid buttonRadius set, override baseRadius fallback
+      conditionalOverrides.radii.button = addCssUnit(radiusValue, cssUnit)
+    } else {
+      LOG.warn(
+        `Invalid button radius: ${buttonRadius}. Falling back to default button radius.`
+      )
+    }
+  }
+
+  // Conditional Overrides - Font Sizes
+
+  if (baseFontSize && baseFontSize > 0) {
+    // Set the root font size to the configured value (used on global styles):
+    conditionalOverrides.fontSizes.baseFontSize = baseFontSize
+  }
+
+  if (codeFontSize) {
+    // Returns font size as a string, or undefined if invalid
+    const parsedCodeFontSize = parseFontSize(
+      "codeFontSize",
+      codeFontSize,
+      inSidebar
+    )
+    if (parsedCodeFontSize) {
+      conditionalOverrides.fontSizes.codeFontSize = parsedCodeFontSize
+    }
+    // codeFontSize default (fallback) set in typography primitives (0.875rem)
+    // inlineCodeFontSize set in typography primitives (0.75em)
+  }
+
+  // Set the heading font sizes based on the heading font sizes config provided
+  conditionalOverrides.fontSizes = setHeadingFontSizes(
+    conditionalOverrides.fontSizes,
+    inSidebar,
+    conditionalOverrides.fontSizes.baseFontSize,
+    headingFontSizes
+  )
+
+  // Conditional Overrides - Metric Value Font Size
+  if (metricValueFontSize) {
+    // Use parseFontSize for format validation
+    const parsedSize = parseFontSize(
+      "metricValueFontSize",
+      metricValueFontSize,
+      inSidebar
+    )
+    if (parsedSize) {
+      // Additional validation: must be greater than 0
+      const numericValue = Number.parseFloat(parsedSize)
+      if (numericValue <= 0) {
+        LOG.warn(
+          `Invalid metricValueFontSize: ${metricValueFontSize} in theme. The metricValueFontSize must be greater than 0. Falling back to default metricValueFontSize.`
+        )
+      } else {
+        conditionalOverrides.fontSizes.metricValueFontSize = parsedSize
+      }
+    }
+  }
+
+  // Conditional Overrides - Font Weights
+
+  // Set the font weights based on the font weight configs provided
+  conditionalOverrides.fontWeights = setFontWeights(
+    baseThemeConfig.emotion.fontWeights,
+    inSidebar,
+    baseFontWeight,
+    codeFontWeight,
+    headingFontWeights
+  )
+
+  // Conditional Overrides - Metric Value Font Weight
+  if (
+    metricValueFontWeight &&
+    isValidFontWeight("metricValueFontWeight", metricValueFontWeight, 100, 900)
+  ) {
+    conditionalOverrides.fontWeights.metricValueFontWeight =
+      metricValueFontWeight
+  }
+
+  // Conditional Overrides - Page Content Padding
+
+  const parsedPaddingTop = parsePadding("paddingTop", paddingTop, inSidebar)
+  if (parsedPaddingTop !== undefined) {
+    conditionalOverrides.paddingTop = parsedPaddingTop
+  }
+
+  const parsedPaddingBottom = parsePadding(
+    "paddingBottom",
+    paddingBottom,
+    inSidebar
+  )
+  if (parsedPaddingBottom !== undefined) {
+    conditionalOverrides.paddingBottom = parsedPaddingBottom
+  }
+
+  // Font Overrides
+
+  // Type for font overrides - represents genericFonts properties that can be overridden
+  type GenericFontOverride = {
+    bodyFont: string
+    codeFont: string
+    headingFont: string
+    // Not configurable through custom themes
+    iconFont: string
+  }
+
+  const fontsOverride: GenericFontOverride = {
+    // Default values for the generic fonts
+    ...genericFonts,
+    // Override properties if configured
+    bodyFont: bodyFont
+      ? parseFont(bodyFont, fonts.sansSerif)
+      : genericFonts.bodyFont,
+    codeFont: codeFont
+      ? parseFont(codeFont, fonts.monospace)
+      : genericFonts.codeFont,
+    headingFont: headingFont
+      ? parseFont(headingFont, fonts.sansSerif)
+      : genericFonts.headingFont,
+  }
+
+  // Handle headingFont fallback
+  if (bodyFont && !headingFont) {
+    fontsOverride.headingFont = parseFont(bodyFont, fonts.sansSerif)
+  }
+
+  // Create shadows - auto-determines light/dark based on bgColor luminance
+  const shadows = createShadows(conditionalOverrides.colors)
+
+  return {
+    ...baseThemeConfig.emotion,
+    genericFonts: fontsOverride,
+    ...conditionalOverrides,
+    shadows,
+  }
+}
+
+export const toThemeInput = (
+  theme: EmotionTheme
+): Partial<CustomThemeConfig> => {
+  const { colors } = theme
+  return {
+    primaryColor: colors.primary,
+    backgroundColor: colors.bgColor,
+    secondaryBackgroundColor: colors.secondaryBg,
+    textColor: colors.bodyText,
+    bodyFont: theme.genericFonts.bodyFont,
+  }
+}
+
+export type ExportedTheme = {
+  base: string
+  primaryColor: string
+  backgroundColor: string
+  secondaryBackgroundColor: string
+  textColor: string
+  bodyFont: string
+} & DerivedColors
+
+export const toExportedTheme = (theme: EmotionTheme): ExportedTheme => {
+  const { colors } = theme
+  const themeInput = toThemeInput(theme)
+
+  // At this point, we know that all of the fields of themeInput are populated
+  // (since we went "backwards" from a theme -> themeInput), but typescript
+  // doesn't know this, so we have to cast each field to string.
+  return {
+    primaryColor: themeInput.primaryColor as string,
+    backgroundColor: themeInput.backgroundColor as string,
+    secondaryBackgroundColor: themeInput.secondaryBackgroundColor as string,
+    textColor: themeInput.textColor as string,
+    bodyFont: themeInput.bodyFont as string,
+    base: bgColorToBaseString(themeInput.backgroundColor),
+
+    ...computeDerivedColors(colors),
+  }
+}
+
+/** True for null, blank or whitespace-only strings, and empty arrays. */
+const isUnsetThemeValue = (value: unknown): boolean =>
+  value === null ||
+  (typeof value === "string" && !value.trim()) ||
+  (Array.isArray(value) && value.length === 0)
+
+/**
+ * Returns the own, non-unset fields of a theme input so lodash merges cannot
+ * copy them onto an empty destination.
+ *
+ * - protobufjs exposes proto3 defaults (for example `textColor = ""`) on the
+ *   message prototype, and `mergeWith` iterates inherited keys.
+ * - A customizer that returns `undefined` tells `mergeWith` to assign the
+ *   source, so skipping defaults still copies `""` onto a missing key.
+ * Nested sections are left as-is; callers run this on those objects too.
+ */
+const omitUnsetThemeValues = <T extends object>(
+  input: T | null | undefined
+): Partial<T> => {
+  if (!input) {
+    return {}
+  }
+
+  return Object.fromEntries(
+    Object.entries(input).filter(([, value]) => !isUnsetThemeValue(value))
+  ) as Partial<T>
+}
+
+/**
+ * Customizer for lodash mergeWith that skips unset theme values (blank or
+ * whitespace-only strings, null, empty arrays) so they do not overwrite valid
+ * values, and replaces non-empty arrays atomically instead of merging by index.
+ */
+const skipUnsetThemeValues = (
+  objValue: unknown,
+  srcValue: unknown
+): unknown => {
+  if (isUnsetThemeValue(srcValue)) {
+    return objValue
+  }
+  // Replace non-empty arrays wholesale — lodash index-merges arrays, which
+  // leaves leftover parent colors/sizes when a section override is shorter.
+  if (Array.isArray(srcValue) && srcValue.length > 0) {
+    return srcValue
+  }
+  return undefined
+}
+
+const completeThemeInput = (
+  partialInput: Partial<CustomThemeConfig>,
+  baseThemeArg: ThemeConfig
+): CustomThemeConfig => {
+  // Drop unset theme values ("", whitespace, null, []) so they don't override
+  // base theme values.
+  return new CustomThemeConfig(
+    mergeWith(
+      {},
+      toThemeInput(baseThemeArg.emotion),
+      omitUnsetThemeValues(partialInput),
+      skipUnsetThemeValues
+    )
+  )
+}
+
+export const createTheme = (
+  themeName: string,
+  themeInput: Partial<CustomThemeConfig>,
+  baseThemeConfig?: ThemeConfig,
+  inSidebar = false
+): ThemeConfig => {
+  let completedThemeInput: CustomThemeConfig
+
+  if (baseThemeConfig) {
+    completedThemeInput = completeThemeInput(themeInput, baseThemeConfig)
+  } else if (themeInput.base === CustomThemeConfig.BaseTheme.DARK) {
+    completedThemeInput = completeThemeInput(themeInput, darkTheme)
+  } else {
+    completedThemeInput = completeThemeInput(themeInput, lightTheme)
+  }
+
+  // We use startingTheme to pick a set of "auxiliary colors" for widgets like
+  // the success/info/warning/error boxes and others; these need to have their
+  // colors tweaked to work well with the background.
+  //
+  // For our auxiliary colors, we pick colors that look reasonable based on the
+  // theme's backgroundColor instead of picking them using themeInput.base.
+  // This way, things will look good even if a user sets
+  // themeInput.base === LIGHT and themeInput.backgroundColor === "black".
+  const bgColor = completedThemeInput.backgroundColor
+  const startingTheme = merge(
+    cloneDeep(
+      baseThemeConfig ?? (getLuminance(bgColor) > 0.5 ? lightTheme : darkTheme)
+    ),
+    { emotion: { inSidebar } }
+  )
+
+  const emotion = createEmotionTheme(completedThemeInput, startingTheme)
+
+  return {
+    ...startingTheme,
+    name: themeName,
+    emotion,
+    themeInput,
+  }
+}
+
+const deleteOldCachedThemes = (): void => {
+  const { CACHED_THEME_VERSION, CACHED_THEME_BASE_KEY } = LocalStore
+  const { localStorage } = window
+
+  // Pre-release versions of theming stored cached themes under the key
+  // "stActiveTheme".
+  localStorage.removeItem("stActiveTheme")
+
+  // The first version of cached themes had keys of the form
+  // `stActiveTheme-${window.location.pathname}` with no version number.
+  localStorage.removeItem(CACHED_THEME_BASE_KEY)
+
+  // Versions before the current schema stored full theme configs. Clear them.
+  for (let i = 1; i < CACHED_THEME_VERSION; i++) {
+    localStorage.removeItem(`${CACHED_THEME_BASE_KEY}-v${i}`)
+  }
+}
+
+export const getThemeSelectionFromThemeConfig = (
+  themeConfig: ThemeConfig
+): ThemeSelection => {
+  if (
+    themeConfig.name === AUTO_THEME_NAME ||
+    themeConfig.name === CUSTOM_THEME_AUTO_NAME
+  ) {
+    return "System"
+  }
+
+  if (
+    themeConfig.name === lightTheme.name ||
+    themeConfig.name === CUSTOM_THEME_LIGHT_NAME
+  ) {
+    return "Light"
+  }
+
+  if (
+    themeConfig.name === darkTheme.name ||
+    themeConfig.name === CUSTOM_THEME_DARK_NAME
+  ) {
+    return "Dark"
+  }
+
+  // Single custom theme ("Custom Theme") has no light/dark distinction,
+  // so we treat it as "System" for caching purposes. This ensures:
+  // 1. No false mapping to preset themes
+  // 2. Embed options can still override on subsequent visits
+  if (themeConfig.name === CUSTOM_THEME_NAME) {
+    return "System"
+  }
+
+  return "System" // This is reached for unrecognized theme names
+}
+
+const isThemeSelection = (value: unknown): value is ThemeSelection =>
+  value === "System" || value === "Light" || value === "Dark"
+
+export const getCachedThemeSelection = (): ThemeSelection | null => {
+  if (!localStorageAvailable()) {
+    return null
+  }
+
+  deleteOldCachedThemes()
+
+  const cachedThemeStr = window.localStorage.getItem(LocalStore.ACTIVE_THEME)
+  if (!cachedThemeStr) {
+    return null
+  }
+
+  const cachedTheme: CachedTheme = JSON.parse(cachedThemeStr)
+  return isThemeSelection(cachedTheme) ? cachedTheme : null
+}
+
+export const setCachedThemeSelection = (themeConfig: ThemeConfig): void => {
+  if (!localStorageAvailable()) {
+    return
+  }
+
+  deleteOldCachedThemes()
+
+  // Do not set the theme if the app has a pre-defined theme from the embedder
+  if (isLightThemeInQueryParams() || isDarkThemeInQueryParams()) {
+    return
+  }
+
+  const cachedTheme: CachedTheme =
+    getThemeSelectionFromThemeConfig(themeConfig)
+
+  window.localStorage.setItem(
+    LocalStore.ACTIVE_THEME,
+    JSON.stringify(cachedTheme)
+  )
+}
+
+export const removeCachedTheme = (): void => {
+  if (!localStorageAvailable()) {
+    return
+  }
+
+  window.localStorage.removeItem(LocalStore.ACTIVE_THEME)
+}
+
+/**
+ * Returns the theme specified by the host via query parameters, or null if no theme is specified.
+ * This differs from getHostSpecifiedTheme() which falls back to auto theme.
+ *
+ * @returns ThemeConfig if host specified via query params (light_theme or dark_theme), null otherwise
+ */
+export const getHostSpecifiedThemeOnly = (): ThemeConfig | null => {
+  if (isLightThemeInQueryParams()) {
+    return getMergedLightTheme()
+  }
+
+  if (isDarkThemeInQueryParams()) {
+    return getMergedDarkTheme()
+  }
+
+  return null
+}
+
+export const getHostSpecifiedTheme = (): ThemeConfig => {
+  return getHostSpecifiedThemeOnly() ?? createAutoTheme()
+}
+
+export const getDefaultTheme = (): ThemeConfig => {
+  // Priority for default theme
+  const hostSpecified = getHostSpecifiedThemeOnly()
+  if (hostSpecified) {
+    return hostSpecified
+  }
+
+  const cachedSelection = getCachedThemeSelection()
+  if (cachedSelection === "Light") {
+    return getMergedLightTheme()
+  }
+
+  if (cachedSelection === "Dark") {
+    return getMergedDarkTheme()
+  }
+
+  return createAutoTheme()
+}
+
+const whiteSpace = /\s+/
+export function computeSpacingStyle(
+  value: string,
+  theme: EmotionTheme
+): string {
+  if (value === "") {
+    return ""
+  }
+
+  return value
+    .split(whiteSpace)
+    .map(marginValue => {
+      if (marginValue === "0") {
+        return theme.spacing.none
+      }
+
+      if (!(marginValue in theme.spacing)) {
+        LOG.error(`Invalid spacing value: ${marginValue}`)
+        return theme.spacing.none
+      }
+
+      return theme.spacing[marginValue as ThemeSpacing]
+    })
+    .join(" ")
+}
+
+export function addCssUnit(n: number, unit: "px" | "rem"): string {
+  return `${n}${unit}`
+}
+
+function roundToTwoDecimals(n: number): number {
+  return Number.parseFloat(n.toFixed(2))
+}
+
+export function blend(color: string, background: string | undefined): string {
+  if (background === undefined) return color
+  const [r, g, b, a] = parseToRgba(color)
+  if (a === 1) return color
+  const [br, bg, bb, ba] = parseToRgba(background)
+  const ao = a + ba * (1 - a)
+  // (xaA + xaB·(1−aA))/aR
+  const ro = Math.round((a * r + ba * br * (1 - a)) / ao)
+  const go = Math.round((a * g + ba * bg * (1 - a)) / ao)
+  const bo = Math.round((a * b + ba * bb * (1 - a)) / ao)
+  return toHex(`rgba(${ro}, ${go}, ${bo}, ${ao})`)
+}
+
+/**
+ * Convert a CSS rem value to pixels.
+ * @param cssValue: a string containing a value in rem units with or without the "rem" unit suffix
+ * @param rootFontSizePx: optional root font size. Prefer `theme.fontSizes.baseFontSize`
+ *   so the conversion matches the theme even before `html { font-size }` is applied.
+ * @returns pixel value of the given rem value
+ */
+export const convertRemToPx = (
+  cssValue: string,
+  rootFontSizePx?: number
+): number => {
+  const remValue = Number.parseFloat(cssValue.replace(/rem$/, ""))
+  const fontSize =
+    rootFontSizePx ??
+    // Fall back to the live root font size, then 16px (tests without a document style).
+    (Number.parseFloat(getComputedStyle(document.documentElement).fontSize) ||
+      16)
+  return remValue * fontSize
+}
+
+/**
+ * Helper function to merge theme section configs (light/dark and light.sidebar/dark.sidebar)
+ * into a consolidated theme input with proper inheritance.
+ * Custom Light theme = uses streamlit base theme + [theme] configs + [theme.light] config overrides
+ * Custom Dark theme = uses streamlit base theme + [theme] configs + [theme.dark] config overrides
+ * Sidebar inherits from main theme with additional [theme.sidebar] overrides
+ * Light sidebar = custom light theme + [theme.sidebar] + [theme.light.sidebar] overrides
+ * Dark sidebar = custom dark theme + [theme.sidebar] + [theme.dark.sidebar] overrides
+ * @param themeInput: the theme input (configs) to merge
+ * @param variant: the theme variant to create ('light' or 'dark')
+ */
+export const handleSectionInheritance = (
+  themeInput: CustomThemeConfig,
+  variant: "light" | "dark"
+): CustomThemeConfig => {
+  const isLightTheme = variant === "light"
+  const base = isLightTheme
+    ? CustomThemeConfig.BaseTheme.LIGHT
+    : CustomThemeConfig.BaseTheme.DARK
+
+  // Destructure to separate concerns: common theme properties, sidebar properties,
+  // and light or dark variant sections
+  const { light, dark, sidebar: baseSidebar, ...commonTheme } = themeInput
+  const variantSection = isLightTheme ? light : dark
+  const { sidebar: variantSidebar, ...variantTheme } = variantSection ?? {}
+
+  // Merge common theme properties with variant overrides (excluding sidebars for now)
+  // Note: base is set explicitly based on variant and is merged last to ensure it overrides
+  // Omit unset theme values before merge so they are not copied onto {}.
+  const result = mergeWith(
+    {} as CustomThemeConfig,
+    omitUnsetThemeValues(commonTheme),
+    omitUnsetThemeValues(variantTheme),
+    { base }, // Set base last to override any base from commonTheme/variantTheme
+    skipUnsetThemeValues
+  )
+
+  // Explicitly merge sidebars with correct precedence: baseSidebar < variantSidebar
+  if (baseSidebar || variantSidebar) {
+    result.sidebar = mergeWith(
+      {},
+      omitUnsetThemeValues(baseSidebar),
+      omitUnsetThemeValues(variantSidebar),
+      skipUnsetThemeValues
+    )
+  }
+
+  return result
+}
+
+/**
+ * Check if a theme section has any non-null/undefined values set.
+ * Checks one level deep for nested objects (e.g., sidebar within light/dark sections).
+ * Treats empty arrays as "no config" since they represent default values.
+ * @param section: The theme section to check (e.g., themeInput.light or themeInput.dark)
+ * @returns true if the section has any actual values set
+ */
+export const hasThemeSectionConfigs = (
+  section: CustomThemeConfig.$Properties | null | undefined
+): boolean => {
+  if (!section) {
+    return false
+  }
+
+  // Helper to check if a value is non-empty (recursively checks one level deep)
+  const isNonEmpty = (value: unknown): boolean => {
+    if (value === null || value === undefined) {
+      return false
+    }
+    // Empty arrays are treated as "no config" (they're default values)
+    if (Array.isArray(value)) {
+      return value.length > 0
+    }
+    // Check nested objects one level deep (e.g., sidebar subsection)
+    if (typeof value === "object") {
+      return Object.values(value).some(isNonEmpty)
+    }
+    return true
+  }
+
+  return Object.values(section).some(isNonEmpty)
+}
+
+/**
+ * Create custom themes from the theme input for main app
+ * Function applies merge of sections/subsections and returns custom light/dark theme(s)
+ * When no light/dark section configs are set, returns "Custom Theme" (1 theme)
+ * When light and/or dark section configs are set, returns "Custom Theme Light", "Custom Theme Dark"
+ * & auto based on system preference ("Use System Setting") (3 themes)
+ * @param themeInput: the theme input (configs) with nested sections/subsections
+ * @returns 1 or 3 custom themes
+ */
+export const createCustomThemes = (
+  themeInput: CustomThemeConfig
+): ThemeConfig[] => {
+  const hasLightConfigs = hasThemeSectionConfigs(themeInput.light)
+  const hasDarkConfigs = hasThemeSectionConfigs(themeInput.dark)
+
+  const customThemes: ThemeConfig[] = []
+
+  // When light or dark theme section configs are set, need to create a custom theme for each
+  if (hasLightConfigs || hasDarkConfigs) {
+    const lightThemeInput = handleSectionInheritance(themeInput, "light")
+    const lightTheme = {
+      ...createTheme(CUSTOM_THEME_LIGHT_NAME, lightThemeInput),
+      displayName: "Light",
+    }
+
+    const darkThemeInput = handleSectionInheritance(themeInput, "dark")
+    const darkTheme = {
+      ...createTheme(CUSTOM_THEME_DARK_NAME, darkThemeInput),
+      displayName: "Dark",
+    }
+
+    // Also add an auto custom theme based on the system preference
+    const autoCustomTheme =
+      getSystemThemePreference() === "dark" ? darkTheme : lightTheme
+    const autoTheme = {
+      ...autoCustomTheme,
+      displayName: AUTO_THEME_NAME,
+      name: CUSTOM_THEME_AUTO_NAME,
+    }
+    // Return light, dark, and auto custom themes
+    customThemes.push(lightTheme, darkTheme, autoTheme)
+  } else {
+    // No light/dark section configs set - single "Custom Theme" returned
+    const customTheme = createTheme(CUSTOM_THEME_NAME, themeInput)
+    // Return the single custom theme
+    customThemes.push(customTheme)
+  }
+
+  return customThemes
+}
+
+/**
+ * Set the default heading font sizes for the sidebar.
+ * @param configHeadingFontSizes: the heading font sizes provided via theme config
+ * @returns the heading font sizes for the sidebar
+ */
+const setSidebarHeadingFontSizes = (
+  configHeadingFontSizes: string[] | null | undefined
+): string[] => {
+  // Default sidebar heading font sizes
+  const defaultHeadingFontSizes = [
+    "1.5rem",
+    "1.25rem",
+    "1.125rem",
+    "1rem",
+    "0.875rem",
+    "0.75rem",
+  ]
+
+  // Merge config overrides with sidebar defaults (for arrays, merge replaces at each index)
+  return merge([], defaultHeadingFontSizes, configHeadingFontSizes ?? [])
+}
+
+/**
+ * Resolves the main theme's light/dark base. Named custom light and dark
+ * themes keep that base even when main-background luminance would imply the
+ * other one. Every other theme uses the main background's luminance.
+ */
+const getActiveThemeBase = (
+  activeTheme: ThemeConfig
+): CustomThemeConfig.BaseTheme => {
+  if (activeTheme.name === CUSTOM_THEME_LIGHT_NAME) {
+    return CustomThemeConfig.BaseTheme.LIGHT
+  }
+  if (activeTheme.name === CUSTOM_THEME_DARK_NAME) {
+    return CustomThemeConfig.BaseTheme.DARK
+  }
+
+  return getLuminance(activeTheme.emotion.colors.bgColor) > 0.5
+    ? CustomThemeConfig.BaseTheme.LIGHT
+    : CustomThemeConfig.BaseTheme.DARK
+}
+
+/** Built-in main page surfaces used to decide stock vs swapped sidebar fallbacks. */
+const stockMainSurfaces = {
+  [CustomThemeConfig.BaseTheme.LIGHT]: {
+    bgColor: lightTheme.emotion.colors.bgColor,
+    secondaryBg: lightTheme.emotion.colors.secondaryBg,
+  },
+  [CustomThemeConfig.BaseTheme.DARK]: {
+    bgColor: darkTheme.emotion.colors.bgColor,
+    secondaryBg: darkTheme.emotion.colors.secondaryBg,
+  },
+} as const
+
+/** Sidebar backgrounds used when main surfaces still match the built-in pair and `[theme.sidebar]` leaves a side unset. */
+export const stockSidebarSurfaces = {
+  [CustomThemeConfig.BaseTheme.LIGHT]: {
+    backgroundColor: "#F8F8F7",
+    // Distinct from the sidebar background so widget fills stay visible.
+    secondaryBackgroundColor: "#F1F0EE",
+  },
+  [CustomThemeConfig.BaseTheme.DARK]: {
+    backgroundColor: "#21201D",
+    secondaryBackgroundColor: "#2D2B27",
+  },
+} as const
+
+/**
+ * Sidebar chrome for the built-in sidebar surface pair.
+ * createSidebarTheme copies a key only when the resolved sidebar surfaces
+ * match that pair, primary still matches stock (main or sidebar), and both
+ * `[theme]` and `[theme.sidebar]` left the key unset. codeTextColor is not in
+ * this table — the sidebar inherits the main theme's resolved code text so a
+ * textColor-only theme stays ink-aligned (stock sidebar surfaces differ from
+ * the main base and would otherwise derive greenTextColor).
+ */
+export const stockSidebarChrome = {
+  [CustomThemeConfig.BaseTheme.LIGHT]: {
+    borderColor: "#D7D3CF",
+    dataframeBorderColor: "#E5E2DF",
+    dataframeHeaderBackgroundColor: "#F3F3F2",
+    codeBackgroundColor: "#F1F1F0",
+  },
+  [CustomThemeConfig.BaseTheme.DARK]: {
+    borderColor: "#4A4742",
+    dataframeBorderColor: "#3F3D39",
+    dataframeHeaderBackgroundColor: "#2A2825",
+    codeBackgroundColor: "#1A1917",
+  },
+} as const
+
+/**
+ * Value to force through the last sidebar merge object for a chrome key.
+ * Valid sidebar values win via merge. Invalid non-blank sidebar values would
+ * otherwise overwrite a valid main color — write the main (or stock) value so
+ * the last merge wins.
+ */
+const stockChromeMergeFallback = (
+  sidebarVal: string | null | undefined,
+  mainVal: string | null | undefined,
+  stockVal: string | undefined
+): string | undefined => {
+  if (firstConfiguredColor(sidebarVal)) {
+    return undefined
+  }
+  const mainOk = firstConfiguredColor(mainVal)
+  if (sidebarVal?.trim() && mainOk) {
+    return mainOk
+  }
+  if (!mainOk) {
+    return stockVal
+  }
+  return undefined
+}
+
+const mainSurfacesAreStock = (
+  activeTheme: ThemeConfig,
+  mainThemeBase: CustomThemeConfig.BaseTheme
+): boolean => {
+  const stock = stockMainSurfaces[mainThemeBase]
+  const { bgColor, secondaryBg } = activeTheme.emotion.colors
+  // Normalize both sides so equivalent spellings (white, #fff, #FFFFFF) still
+  // count as the built-in pair. A raw string compare would treat those as
+  // customized and swap the sidebar.
+  return (
+    toHex(bgColor) === toHex(stock.bgColor) &&
+    toHex(secondaryBg) === toHex(stock.secondaryBg)
+  )
+}
+
+/**
+ * Create the sidebar's theme, including any sidebar custom theme configurations
+ * Note: handleSectionInheritance has already handled section inheritance for sidebar
+ * in generating the main theme.
+ * @returns active theme to be used for the sidebar
+ */
+export const createSidebarTheme = (activeTheme: ThemeConfig): ThemeConfig => {
+  const sidebarThemeInput = activeTheme.themeInput?.sidebar
+  const { bgColor, secondaryBg } = activeTheme.emotion.colors
+  const mainThemeBase = getActiveThemeBase(activeTheme)
+  const stockSurfaces = stockSidebarSurfaces[mainThemeBase]
+  const stockChrome = stockSidebarChrome[mainThemeBase]
+
+  // Built-in main surfaces → stock sidebar pair. Otherwise → classic swap
+  // (sidebar bg = main secondary, sidebar secondary = main bg).
+  const useStockSidebarSurfaces = mainSurfacesAreStock(
+    activeTheme,
+    mainThemeBase
+  )
+  const fallbackBackground = useStockSidebarSurfaces
+    ? stockSurfaces.backgroundColor
+    : secondaryBg
+  const fallbackSecondary = useStockSidebarSurfaces
+    ? stockSurfaces.secondaryBackgroundColor
+    : bgColor
+
+  const sidebarBackground =
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- blank/whitespace background color means unset
+    sidebarThemeInput?.backgroundColor?.trim() || fallbackBackground
+
+  const secondaryBackgroundColor =
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- blank/whitespace secondary background color means unset
+    sidebarThemeInput?.secondaryBackgroundColor?.trim() || fallbackSecondary
+
+  // Handle configured vs. default header font sizes for sidebar
+  const headingFontSizes = setSidebarHeadingFontSizes(
+    sidebarThemeInput?.headingFontSizes
+  )
+
+  // Named custom light/dark themes keep that base. Other themes follow
+  // the resolved sidebar background's luminance.
+  const baseTheme =
+    activeTheme.name === CUSTOM_THEME_LIGHT_NAME ||
+    activeTheme.name === CUSTOM_THEME_DARK_NAME
+      ? mainThemeBase
+      : getLuminance(sidebarBackground) > 0.5
+        ? CustomThemeConfig.BaseTheme.LIGHT
+        : CustomThemeConfig.BaseTheme.DARK
+
+  // Use stock sidebar chrome only when the sidebar still looks built-in:
+  // - resolved sidebar surfaces match stockSidebarSurfaces
+  // - resolved primary (sidebar override, else main) matches stock — a
+  //   primaryColor-only theme derives chrome in createEmotionTheme, so the
+  //   sidebar follows the same rule
+  // Each key is filled only if neither [theme] nor [theme.sidebar] sets a
+  // valid value (invalid sidebar values yield to a valid main color).
+  const stockPrimary =
+    mainThemeBase === CustomThemeConfig.BaseTheme.LIGHT
+      ? lightTheme.emotion.colors.primary
+      : darkTheme.emotion.colors.primary
+  const primaryForChromeGate =
+    firstConfiguredColor(sidebarThemeInput?.primaryColor) ??
+    activeTheme.emotion.colors.primary
+  const canUseStockSidebarChrome =
+    colorsMatchAsHex(sidebarBackground, stockSurfaces.backgroundColor) &&
+    colorsMatchAsHex(
+      secondaryBackgroundColor,
+      stockSurfaces.secondaryBackgroundColor
+    ) &&
+    colorsMatchAsHex(primaryForChromeGate, stockPrimary)
+
+  const stockChromeFallbacks: {
+    borderColor?: string
+    dataframeBorderColor?: string
+    dataframeHeaderBackgroundColor?: string
+    codeBackgroundColor?: string
+    codeTextColor?: string
+  } = {}
+  if (canUseStockSidebarChrome) {
+    const mainThemeInput = activeTheme.themeInput
+
+    const borderFallback = stockChromeMergeFallback(
+      sidebarThemeInput?.borderColor,
+      mainThemeInput?.borderColor,
+      stockChrome.borderColor
+    )
+    if (borderFallback !== undefined) {
+      stockChromeFallbacks.borderColor = borderFallback
+    }
+
+    // Distinct stock dataframe hex only when neither section set a valid
+    // border or dataframe border. Do not treat a stock border fallback as an
+    // author-set borderColor (that would skip the stock dataframe hex).
+    const resolvedBorder = firstConfiguredColor(
+      sidebarThemeInput?.borderColor,
+      mainThemeInput?.borderColor
+    )
+    const dataframeFallback = stockChromeMergeFallback(
+      sidebarThemeInput?.dataframeBorderColor,
+      mainThemeInput?.dataframeBorderColor,
+      resolvedBorder ? undefined : stockChrome.dataframeBorderColor
+    )
+    if (dataframeFallback !== undefined) {
+      stockChromeFallbacks.dataframeBorderColor = dataframeFallback
+    }
+
+    for (const key of [
+      "dataframeHeaderBackgroundColor",
+      "codeBackgroundColor",
+    ] as const) {
+      const fallback = stockChromeMergeFallback(
+        sidebarThemeInput?.[key],
+        mainThemeInput?.[key],
+        stockChrome[key]
+      )
+      if (fallback !== undefined) {
+        stockChromeFallbacks[key] = fallback
+      }
+    }
+
+    // Keep unset code text body-aligned for the stock sidebar surface pair
+    // (those surfaces differ from the main base and would otherwise derive
+    // greenTextColor). Prefer the sidebar's own textColor when set; otherwise
+    // inherit the main theme's resolved code text.
+    const codeTextStockVal =
+      firstConfiguredColor(sidebarThemeInput?.textColor) ??
+      activeTheme.emotion.colors.codeTextColor
+    const codeTextFallback = stockChromeMergeFallback(
+      sidebarThemeInput?.codeTextColor,
+      mainThemeInput?.codeTextColor,
+      codeTextStockVal
+    )
+    if (codeTextFallback !== undefined) {
+      stockChromeFallbacks.codeTextColor = codeTextFallback
+    }
+  }
+
+  // Omit unset theme values (e.g. textColor "") so they are not copied onto the
+  // empty destination and later rejected as invalid colors.
+  const mergedSidebarThemeInput = mergeWith(
+    {},
+    omitUnsetThemeValues(activeTheme.themeInput),
+    omitUnsetThemeValues(sidebarThemeInput),
+    {
+      // Explicit overrides that should always be applied
+      base: baseTheme,
+      backgroundColor: sidebarBackground,
+      secondaryBackgroundColor: secondaryBackgroundColor,
+      headingFontSizes: headingFontSizes,
+      ...stockChromeFallbacks,
+    },
+    skipUnsetThemeValues
+  )
+
+  // Create the theme with overrides
+  return createTheme(
+    "Sidebar",
+    mergedSidebarThemeInput,
+    undefined, // Creating a new theme from scratch
+    true // inSidebar
+  )
+}
+
+/**
+ * Maps a user's cached theme selection to the best matching theme from available themes.
+ *
+ * @param cachedThemeSelection - The user's cached theme selection
+ * @param availableThemes - The list of currently available themes
+ * @returns The best matching theme, or null if no suitable match found
+ *
+ * @example
+ * // When custom themes exist:
+ * mapCachedThemeSelectionToAvailableTheme("Light", [customLight, customDark, customAuto])
+ * // Returns customLight (CUSTOM_THEME_LIGHT_NAME)
+ *
+ * @example
+ * // When only preset themes:
+ * mapCachedThemeSelectionToAvailableTheme("Light", [lightTheme, darkTheme])
+ * // Returns lightTheme ("Light")
+ */
+export const mapCachedThemeSelectionToAvailableTheme = (
+  cachedThemeSelection: ThemeSelection | null,
+  availableThemes: ThemeConfig[]
+): ThemeConfig | null => {
+  if (!cachedThemeSelection) {
+    return null
+  }
+
+  const mappedNames: Record<ThemeSelection, string[]> = {
+    System: [CUSTOM_THEME_AUTO_NAME, AUTO_THEME_NAME, CUSTOM_THEME_NAME],
+    Light: [CUSTOM_THEME_LIGHT_NAME, lightTheme.name],
+    Dark: [CUSTOM_THEME_DARK_NAME, darkTheme.name],
+  }
+
+  for (const themeName of mappedNames[cachedThemeSelection]) {
+    const match = availableThemes.find(theme => theme.name === themeName)
+    if (match) {
+      return match
+    }
+  }
+
+  return null
+}
+
+/**
+ * Gets the user's preferred theme from available themes.
+ * Host-specified embed options take precedence over cached selections.
+ *
+ * @param availableThemes - The list of currently available themes
+ * @returns The best matching theme, or null if no preference found
+ */
+export const getPreferredTheme = (
+  availableThemes: ThemeConfig[]
+): ThemeConfig | null => {
+  const hostSpecified = getHostSpecifiedThemeOnly()
+  const hostSpecifiedSelection = hostSpecified
+    ? getThemeSelectionFromThemeConfig(hostSpecified)
+    : null
+  const userPreferenceSelection =
+    hostSpecifiedSelection ?? getCachedThemeSelection()
+
+  return mapCachedThemeSelectionToAvailableTheme(
+    userPreferenceSelection,
+    availableThemes
+  )
+}

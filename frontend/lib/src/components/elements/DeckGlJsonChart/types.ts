@@ -1,0 +1,81 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import type { DeckProps, View } from "@deck.gl/core"
+
+import type {
+  DeckGlJsonChart as DeckGlJsonChartProto,
+  streamlit,
+} from "@streamlit/protobuf"
+
+import type { WidgetStateManager } from "~lib/WidgetStateManager"
+
+type SerializedLayer = {
+  /** @see https://deck.gl/docs/api-reference/json/conversion-reference */
+  "@@type": string
+  id?: string
+  /** @see https://deck.gl/docs/developer-guide/performance#use-updatetriggers */
+  updateTriggers?: Record<string, unknown[]>
+} & Record<string, unknown>
+
+export type ParsedDeckGlConfig = {
+  /**
+   * Absent when `st.pydeck_chart(None)` sends an empty map. Entries are
+   * `null` where pydeck serializes a `None` layer.
+   */
+  layers?: Array<SerializedLayer | null>
+  initialViewState: Record<string, unknown>
+  views?: unknown
+  /** GPU parameters from pydeck (`{ cull: true }` in examples). */
+  parameters?: DeckProps["parameters"]
+  mapStyle?: string
+  mapProvider?: string
+  cartoKey?: string
+}
+
+export interface DeckGLProps {
+  disabled?: boolean
+  disableFullscreenMode?: boolean
+  element: DeckGlJsonChartProto
+  fragmentId: string | undefined
+  heightConfig?: streamlit.HeightConfig.$Properties | null
+  widgetMgr: WidgetStateManager
+  widthConfig?: streamlit.WidthConfig.$Properties | null
+}
+
+export interface DeckObject {
+  initialViewState: Record<string, unknown> & {
+    height: number
+    width: number
+  }
+  layers: DeckProps["layers"]
+  views?: View | View[]
+  parameters?: DeckProps["parameters"]
+  mapStyle?: string | Array<string>
+  mapProvider?: string
+  cartoKey?: string
+}
+
+/**
+ * @see PydeckState in the backend for the corresponding Python type.
+ */
+export type DeckGlElementState = {
+  /** Keyed by layer ID. Layers without a selection have no entry. */
+  selection: {
+    indices: { [layerId: string]: number[] | undefined }
+    objects: { [layerId: string]: unknown[] | undefined }
+  }
+}

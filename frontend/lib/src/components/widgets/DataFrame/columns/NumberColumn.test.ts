@@ -1,0 +1,742 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* eslint-disable  @typescript-eslint/no-non-null-assertion */
+
+import { GridCellKind, type NumberCell } from "@glideapps/glide-data-grid"
+import {
+  Duration,
+  DurationNanosecond,
+  Field,
+  Float64,
+  Int64,
+  TimeUnit,
+  Uint64,
+} from "apache-arrow"
+
+import {
+  type ArrowType,
+  DataFrameCellType,
+  type DataType,
+} from "~lib/dataframes/arrowTypeUtils"
+
+import NumberColumn, { type NumberColumnParams } from "./NumberColumn"
+import { type BaseColumnProps, type ErrorCell, isErrorCell } from "./utils"
+
+const MOCK_FLOAT_ARROW_TYPE: ArrowType = {
+  type: DataFrameCellType.DATA,
+  arrowField: new Field("float_column", new Float64(), true),
+  pandasType: {
+    field_name: "float_column",
+    name: "float_column",
+    pandas_type: "float64",
+    numpy_type: "float64",
+    metadata: null,
+  },
+}
+
+const MOCK_INT_ARROW_TYPE: ArrowType = {
+  type: DataFrameCellType.DATA,
+  arrowField: new Field("int_column", new Int64(), true),
+  pandasType: {
+    field_name: "int_column",
+    name: "int_column",
+    pandas_type: "int64",
+    numpy_type: "int64",
+    metadata: null,
+  },
+}
+
+const MOCK_UINT_ARROW_TYPE: ArrowType = {
+  type: DataFrameCellType.DATA,
+  arrowField: new Field("uint_column", new Uint64(), true),
+  pandasType: {
+    field_name: "uint_column",
+    name: "uint_column",
+    pandas_type: "uint64",
+    numpy_type: "uint64",
+    metadata: null,
+  },
+}
+
+const MOCK_DURATION_ARROW_TYPE: ArrowType = {
+  type: DataFrameCellType.DATA,
+  arrowField: new Field("duration_column", new DurationNanosecond(), true),
+  pandasType: {
+    field_name: "duration_column",
+    name: "duration_column",
+    pandas_type: "object",
+    numpy_type: "timedelta64[ns]",
+    metadata: null,
+  },
+}
+
+function getDurationArrowType(unit: TimeUnit, numpyType: string): ArrowType {
+  return {
+    ...MOCK_DURATION_ARROW_TYPE,
+    arrowField: new Field("duration_column", new Duration(unit), true),
+    pandasType: {
+      ...MOCK_DURATION_ARROW_TYPE.pandasType!,
+      numpy_type: numpyType,
+    },
+  }
+}
+
+const NUMBER_COLUMN_TEMPLATE: Partial<BaseColumnProps> = {
+  id: "1",
+  name: "number_column",
+  title: "Number column",
+  indexNumber: 0,
+  isEditable: false,
+  isHidden: false,
+  isIndex: false,
+  isPinned: false,
+  isStretched: false,
+}
+
+function getNumberColumn(
+  arrowType: ArrowType,
+  params?: NumberColumnParams,
+  baseProps?: Partial<BaseColumnProps>
+): ReturnType<typeof NumberColumn> {
+  return NumberColumn({
+    ...NUMBER_COLUMN_TEMPLATE,
+    arrowType,
+    columnTypeOptions: params,
+    ...baseProps,
+  } as BaseColumnProps)
+}
+
+describe("NumberColumn", () => {
+  afterEach(() => {
+    // Restore original value after each test
+    Object.defineProperty(navigator, "languages", {
+      value: navigator.languages,
+      configurable: true,
+    })
+  })
+
+  it("creates a valid column instance", () => {
+    const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE)
+    expect(mockColumn.kind).toEqual("number")
+    expect(mockColumn.title).toEqual(NUMBER_COLUMN_TEMPLATE.title)
+    expect(mockColumn.id).toEqual(NUMBER_COLUMN_TEMPLATE.id)
+    expect(mockColumn.isEditable).toEqual(NUMBER_COLUMN_TEMPLATE.isEditable)
+    expect(mockColumn.sortMode).toEqual("smart")
+
+    const mockCell = mockColumn.getCell("1.234")
+    expect(mockCell.kind).toEqual(GridCellKind.Number)
+    expect((mockCell as NumberCell).displayData).toEqual("1.234")
+    expect((mockCell as NumberCell).data).toEqual(1.234)
+  })
+
+  it("aligns numbers to the right", () => {
+    const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE)
+    const mockCell = mockColumn.getCell("1.123")
+    expect(mockCell.contentAlign).toEqual("right")
+  })
+
+  it.each(["left", "center", "right"] as const)(
+    "respects custom contentAlignment: %s",
+    alignment => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, undefined, {
+        contentAlignment: alignment,
+      })
+      const mockCell = mockColumn.getCell("1.123")
+      expect(mockCell.contentAlign).toEqual(alignment)
+    }
+  )
+
+  it.each([
+    [true, 1],
+    [false, 0],
+    ["4.12", 4.12],
+    ["-4.12", -4.12],
+    ["4", 4],
+    [1.3122, 1.3122],
+    [-1.3122, -1.3122],
+    ["1,212.12", 1212.12],
+    [".1312314", 0.1312314],
+    [null, null],
+    [undefined, null],
+    ["", null],
+  ])(
+    "supports float64 value (%p parsed as %p)",
+    (input: DataType | null | undefined, value: number | null) => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE)
+      const cell = mockColumn.getCell(input)
+      expect(mockColumn.getCellValue(cell)).toEqual(value)
+    }
+  )
+
+  it.each([
+    [100, 100],
+    [-100, -100],
+    ["4", 4],
+    ["4.12", 4],
+    ["4.61", 4],
+    ["-4.12", -4],
+    [1.3122, 1],
+    [-1.3122, -1],
+    ["1,212", 1212],
+    ["1,212,123,312", 1212123312],
+    [null, null],
+  ])(
+    "supports integer value (%p parsed as %p)",
+    (input: DataType | null, value: number | null) => {
+      const mockColumn = getNumberColumn(MOCK_INT_ARROW_TYPE)
+      const cell = mockColumn.getCell(input)
+      expect(mockColumn.getCellValue(cell)).toEqual(value)
+    }
+  )
+
+  it("properly configures the column for unsigned integers", () => {
+    const mockColumn = getNumberColumn(MOCK_UINT_ARROW_TYPE)
+    expect(mockColumn.kind).toEqual("number")
+
+    const mockCell = mockColumn.getCell("104")
+    expect(mockCell.kind).toEqual(GridCellKind.Number)
+    expect((mockCell as NumberCell).fixedDecimals).toEqual(0)
+    expect((mockCell as NumberCell).allowNegative).toEqual(false)
+  })
+
+  it.each([
+    [100, true],
+    [-100, false],
+    ["4", true],
+    ["-4.12", false],
+  ])(
+    "supports unsigned integer validation (%p validates to %p)",
+    (input: DataType | null, valid: boolean) => {
+      const mockColumn = getNumberColumn(MOCK_UINT_ARROW_TYPE)
+      expect(mockColumn.validateInput!(input)).toEqual(valid)
+    }
+  )
+
+  it.each([
+    [0, 1.234567, 1],
+    [0.1, 1.234567, 1.2],
+    [0.01, 1.234567, 1.23],
+    [0.001, 1.234567, 1.234],
+    [0.0001, 1.234567, 1.2345],
+    [0.001, 1.1, 1.1],
+    [0.00000001, 1, 1],
+  ])(
+    "converts value to precision from step %p (%p converted to %p)",
+    (step: number, input: DataType, value: number | null) => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        step,
+      })
+      const mockCell = mockColumn.getCell(input)
+      expect(mockColumn.getCellValue(mockCell)).toEqual(value)
+    }
+  )
+
+  it.each([
+    [0, 1.234567, "1"],
+    [0.1, 1.234567, "1.2"],
+    [0.01, 1.234567, "1.23"],
+    [0.001, 1.234567, "1.234"],
+    [0.0001, 1.234567, "1.2345"],
+    [0.001, 1.1, "1.100"],
+    [0.00000001, 1, "1.00000000"],
+  ])(
+    "correctly adapts default value to precision from step %p (%p displayed as %p)",
+    (step: number, input: DataType, displayValue: string) => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        step,
+      })
+      const mockCell = mockColumn.getCell(input)
+      expect((mockCell as NumberCell).displayData).toEqual(displayValue)
+    }
+  )
+
+  it.each([
+    [10, 10, true],
+    [10, 100, true],
+    [10, 5, false],
+    [10, -5, false],
+  ])(
+    "supports minimal value configuration %p (%p validates to %p)",
+    (min_value: number, input: DataType, valid: boolean) => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        min_value,
+      })
+      expect(mockColumn.validateInput!(input)).toEqual(valid)
+    }
+  )
+
+  it.each([
+    [10, 10, true],
+    [10, 100, 10],
+    [10, 5, true],
+    [10, -5, true],
+  ])(
+    "supports maximal value configuration %p (%p validates to %p)",
+    (max_value: number, input: DataType, validation: number | boolean) => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        max_value,
+      })
+      expect(mockColumn.validateInput!(input)).toEqual(validation)
+    }
+  )
+
+  it.each([
+    [[]],
+    ["foo"],
+    [[1, 2]],
+    ["123.124.123"],
+    ["--123"],
+    ["2,,2"],
+    ["12345678987654321"],
+  ])("%p results in error cell", (input: unknown) => {
+    const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE)
+    const cell = mockColumn.getCell(input)
+    expect(isErrorCell(cell)).toEqual(true)
+  })
+
+  it("shows an error cell if the numeric value is too large", () => {
+    const mockColumn = getNumberColumn(MOCK_INT_ARROW_TYPE)
+    const unsafeCell = mockColumn.getCell("1234567898765432123")
+    expect(isErrorCell(unsafeCell)).toEqual(true)
+    expect((unsafeCell as ErrorCell)?.data).toEqual("1234567898765432123")
+    expect((unsafeCell as ErrorCell)?.errorDetails).toEqual(
+      "The value is larger than the maximum supported integer values in number columns (2^53)."
+    )
+  })
+
+  it("doesn't show an error for large integers with a size up to 2^53", () => {
+    const mockColumn = getNumberColumn(MOCK_INT_ARROW_TYPE)
+
+    const safeCell = mockColumn.getCell("1234567898765432")
+    expect(isErrorCell(safeCell)).toEqual(false)
+  })
+
+  it.each([
+    [Infinity, "Infinity"],
+    [-Infinity, "-Infinity"],
+  ])("shows %s as %s instead of an empty cell", (value, expected) => {
+    const mockCell = getNumberColumn(MOCK_FLOAT_ARROW_TYPE).getCell(value)
+
+    expect(isErrorCell(mockCell)).toEqual(false)
+    expect((mockCell as NumberCell).data).toEqual(value)
+    expect((mockCell as NumberCell).displayData).toEqual(expected)
+  })
+
+  it.each([
+    // This should support everything that is supported by formatNumber
+    // So we are not testing all the cases here, just a few to make sure it works
+    // All other cases are tested for formatNumber in utils.test.ts
+    [10.123, "%d", "10"],
+    [10.123, "%i", "10"],
+    [10.123, "%u", "10"],
+    [10.123, "%f", "10.123"],
+    [10.123, "%g", "10.123"],
+    [10, "$%.2f", "$10.00"],
+    [10.126, "$%.2f", "$10.13"],
+    [10.123, "%.2f€", "10.12€"],
+    [10.126, "($%.2f)", "($10.13)"],
+    [65, "%d years", "65 years"],
+    [1234567898765432, "%d ⭐", "1234567898765432 ⭐"],
+    [72.3, "%.1f%%", "72.3%"],
+    [-5.678, "%.1f", "-5.7"],
+    [0.12, "percent", "12%"],
+    [1100, "compact", "1.1K"],
+    [-1234.567, "accounting", "(1,234.57)"],
+    [-1234.567, "dollar", "-$1,234.57"],
+    [-1234.567, "euro", "-€1,234.57"],
+    [-1234.567, "yen", "-¥1,235"],
+    [-1234.567, "localized", "-1,234.567"],
+    [-1234.567, "plain", "-1234.567"],
+    [-1234.567, "scientific", "-1.235E3"],
+    [-1234.567, "engineering", "-1.235E3"],
+    [1200000, "bytes", "1.2MB"],
+    [1234, "bytes", "1.2KB"],
+    // Thousand separator formats
+    [1000, "%,.0f", "1,000"],
+    [25000.25, "$%,.2f", "$25,000.25"],
+    [9876543210, "%,.0f", "9,876,543,210"],
+    [1234567.89, "%'_,.2f", "1_234_567.89"],
+    [1234567, "%_d", "1_234_567"],
+    [1234567.89, "%_.2f", "1_234_567.89"],
+  ])(
+    "formats %p with sprintf format %p to %p",
+    (input: number, format: string, displayValue: string) => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        format,
+      })
+
+      const cell = mockColumn.getCell(input)
+      expect((cell as NumberCell).displayData).toEqual(displayValue)
+    }
+  )
+
+  it.each([
+    [10, "%d %d"],
+    [1234.5678, "%+.2E"],
+    [0.000123456, "%+.2E"],
+    [-0.000123456, "%+.2E"],
+    [255, "%#x"],
+    [4096, "%#X"],
+    [42, "% d"],
+  ])(
+    "cannot format %p using the sprintf format %p",
+    (input: number, format: string) => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        format,
+      })
+
+      const cell = mockColumn.getCell(input)
+      expect(isErrorCell(cell)).toEqual(true)
+    }
+  )
+
+  it.each([
+    [10, "10"],
+    [1234567, "1234567"],
+    [12345.678, "12345.678"],
+    [-0.000123456, "-0.000123456"],
+    [null, ""],
+    [undefined, ""],
+  ])(
+    "uses raw number for copyData so that %p is copied as %p",
+    (input: number | null | undefined, expectedCopyData: string) => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        format: "$%.2f",
+      })
+
+      const cell = mockColumn.getCell(input)
+      expect(cell.copyData).toEqual(expectedCopyData)
+    }
+  )
+
+  // Issue #11291 - st.column_config 'localized' option
+  it("handles localized format for format=localized", () => {
+    // Update navigator.languages for this test
+    Object.defineProperty(navigator, "languages", {
+      value: ["pt-BR"],
+      configurable: true,
+    })
+
+    const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+      format: "localized",
+    })
+
+    const cell = mockColumn.getCell(50000)
+    expect((cell as NumberCell).displayData).toEqual("50.000")
+
+    const cell2 = mockColumn.getCell(0.5)
+    expect((cell2 as NumberCell).displayData).toEqual("0,5")
+  })
+
+  it("handles localized format for format=percent", () => {
+    // Update navigator.languages for this test
+    Object.defineProperty(navigator, "languages", {
+      // Turkish displays percent sign in front
+      value: ["tr-TR"],
+      configurable: true,
+    })
+
+    const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+      format: "percent",
+    })
+
+    const cell = mockColumn.getCell(0.5)
+    expect((cell as NumberCell).displayData).toEqual("%50")
+  })
+
+  it("handles localized format for format=engineering", () => {
+    // Update navigator.languages for this test
+    Object.defineProperty(navigator, "languages", {
+      // France displays engineering notation with comma separator
+      value: ["fr-FR"],
+      configurable: true,
+    })
+
+    const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+      format: "scientific",
+    })
+
+    const cell = mockColumn.getCell(1234.56)
+    expect((cell as NumberCell).displayData).toEqual("1,235E3")
+  })
+
+  it("handles localized format for format=euro", () => {
+    // Update navigator.languages for this test
+    Object.defineProperty(navigator, "languages", {
+      // use locale with non-euro currency
+      value: ["en-US"],
+      configurable: true,
+    })
+
+    const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+      format: "euro",
+    })
+
+    const cell = mockColumn.getCell(1234.56)
+    expect((cell as NumberCell).displayData).toEqual("€1,234.56")
+  })
+
+  it("handles invalid localized format - falls back to default format", () => {
+    // Update navigator.languages for this test
+    Object.defineProperty(navigator, "languages", {
+      value: ["INVALID"],
+      configurable: true,
+    })
+
+    const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+      format: "localized",
+    })
+
+    const cell = mockColumn.getCell(50000)
+    expect((cell as NumberCell).displayData).toEqual("50,000")
+
+    const cell2 = mockColumn.getCell(0.5)
+    expect((cell2 as NumberCell).displayData).toEqual("0.5")
+  })
+
+  describe("validateInput with required cells", () => {
+    it("rejects empty values when the column is required", () => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, undefined, {
+        isRequired: true,
+      })
+      expect(mockColumn.validateInput!(null)).toBe(false)
+      expect(mockColumn.validateInput!(undefined)).toBe(false)
+      expect(mockColumn.validateInput!("")).toBe(false)
+    })
+
+    it("accepts empty values when the column is not required", () => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, undefined, {
+        isRequired: false,
+      })
+      expect(mockColumn.validateInput!(null)).toBe(true)
+      expect(mockColumn.validateInput!(undefined)).toBe(true)
+      expect(mockColumn.validateInput!("")).toBe(true)
+    })
+
+    it("rejects non-numeric values that parse to NaN", () => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE)
+      expect(mockColumn.validateInput!("not-a-number")).toBe(false)
+    })
+  })
+
+  describe("getCell with input validation", () => {
+    it("returns an error cell when validation fails for invalid input", () => {
+      const mockColumn = getNumberColumn(MOCK_UINT_ARROW_TYPE)
+      const errorCell = mockColumn.getCell(-5, true)
+      expect(isErrorCell(errorCell)).toBe(true)
+      expect((errorCell as ErrorCell).errorDetails).toEqual("Invalid input.")
+    })
+
+    it("returns an error cell when value falls below min_value during validation", () => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        min_value: 10,
+      })
+      const errorCell = mockColumn.getCell(5, true)
+      expect(isErrorCell(errorCell)).toBe(true)
+      expect((errorCell as ErrorCell).errorDetails).toEqual("Invalid input.")
+    })
+
+    it("auto-corrects values that exceed max_value when validating", () => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        max_value: 10,
+      })
+      const cell = mockColumn.getCell(100, true)
+      expect(isErrorCell(cell)).toBe(false)
+      // The corrected value (10) is what ends up in the cell.
+      expect((cell as NumberCell).data).toEqual(10)
+    })
+
+    it("does not validate when validate flag is false", () => {
+      const mockColumn = getNumberColumn(MOCK_FLOAT_ARROW_TYPE, {
+        max_value: 10,
+      })
+      const cell = mockColumn.getCell(100, false)
+      // Without validation, the original value passes through unchanged.
+      expect((cell as NumberCell).data).toEqual(100)
+    })
+  })
+
+  it("uses humanized duration formatting by default", () => {
+    // Duration cells receive seconds (converted from Arrow ticks in
+    // getCellFromArrow). Without a custom format they render a humanized
+    // duration, left-aligned, and store the second count for numeric sorting.
+    const mockColumn = getNumberColumn(MOCK_DURATION_ARROW_TYPE)
+    const cell = mockColumn.getCell(60)
+    expect(cell.contentAlign).toEqual("left")
+    expect((cell as NumberCell).data).toEqual(60)
+    // Use regex to avoid coupling to the exact locale duration string.
+    expect((cell as NumberCell).displayData).toMatch(/minute/i)
+    expect((cell as NumberCell).copyData).toEqual("60")
+  })
+
+  it("keeps a minus sign for negative durations", () => {
+    const mockColumn = getNumberColumn(MOCK_DURATION_ARROW_TYPE)
+    const cell = mockColumn.getCell(-3 * 24 * 60 * 60)
+    expect((cell as NumberCell).displayData).toMatch(/^-/)
+  })
+
+  it("renders multi-day durations stored as seconds", () => {
+    // 200 days in nanoseconds would overflow Number.MAX_SAFE_INTEGER;
+    // storing seconds keeps the cell numeric and sortable.
+    const mockColumn = getNumberColumn(MOCK_DURATION_ARROW_TYPE)
+    const twoHundredDays = 200 * 24 * 60 * 60
+    const cell = mockColumn.getCell(twoHundredDays)
+    expect(isErrorCell(cell)).toEqual(false)
+    expect((cell as NumberCell).data).toEqual(twoHundredDays)
+    expect((cell as NumberCell).displayData.length).toBeGreaterThan(0)
+  })
+
+  it("applies numeric formats to duration values in seconds", () => {
+    const mockColumn = getNumberColumn(MOCK_DURATION_ARROW_TYPE, {
+      format: "%.0f s",
+    })
+    const cell = mockColumn.getCell(60)
+    expect(cell.contentAlign).toEqual("right")
+    expect((cell as NumberCell).displayData).toEqual("60 s")
+  })
+
+  it("applies the localized duration format on duration columns", () => {
+    const mockColumn = getNumberColumn(MOCK_DURATION_ARROW_TYPE, {
+      format: "localized",
+    })
+    const twoHours = mockColumn.getCell(7200)
+    expect(twoHours.contentAlign).toEqual("right")
+    expect((twoHours as NumberCell).displayData).toMatch(/2 hr|02:00:00/i)
+
+    const fiveSeconds = mockColumn.getCell(5)
+    expect((fiveSeconds as NumberCell).displayData).toMatch(/5 sec|00:00:05/i)
+
+    const fractionalSecond = mockColumn.getCell(1.5)
+    expect((fractionalSecond as NumberCell).displayData).toMatch(
+      /1 sec, 500 ms|00:00:01.5/i
+    )
+  })
+
+  it.each([MOCK_DURATION_ARROW_TYPE, MOCK_FLOAT_ARROW_TYPE])(
+    "humanizes values as a duration when format is duration",
+    arrowType => {
+      const mockColumn = getNumberColumn(arrowType, {
+        format: "duration",
+      })
+      const fewSeconds = mockColumn.getCell(5)
+      expect(fewSeconds.contentAlign).toEqual("left")
+      expect((fewSeconds as NumberCell).displayData).toEqual("a few seconds")
+
+      const twoHours = mockColumn.getCell(7200)
+      expect((twoHours as NumberCell).displayData).toMatch(/hour/i)
+      expect((twoHours as NumberCell).copyData).toEqual("7200")
+    }
+  )
+
+  it("formats duration values as an elapsed-time clock when format is compact", () => {
+    const mockColumn = getNumberColumn(MOCK_DURATION_ARROW_TYPE, {
+      format: "compact",
+    })
+    const oneSecond = mockColumn.getCell(1)
+    expect(oneSecond.contentAlign).toEqual("right")
+    expect((oneSecond as NumberCell).displayData).toEqual("00:00:01")
+
+    const twoHours = mockColumn.getCell(7200)
+    expect((twoHours as NumberCell).displayData).toEqual("02:00:00")
+
+    const fourteenDays = mockColumn.getCell(14 * 24 * 60 * 60)
+    expect((fourteenDays as NumberCell).displayData).toEqual("336:00:00")
+
+    const fractionalSecond = mockColumn.getCell(1.00025)
+    expect((fractionalSecond as NumberCell).displayData).toEqual(
+      "00:00:01.00025"
+    )
+
+    const negativeFraction = mockColumn.getCell(-0.5)
+    expect((negativeFraction as NumberCell).displayData).toEqual("-00:00:00.5")
+  })
+
+  it.each([
+    [TimeUnit.SECOND, "timedelta64[s]", 90, true],
+    [TimeUnit.SECOND, "timedelta64[s]", 90.5, false],
+    [TimeUnit.SECOND, "timedelta64[s]", 9_223_372_036, true],
+    [TimeUnit.SECOND, "timedelta64[s]", 9_223_372_036.000_008, false],
+    [TimeUnit.MILLISECOND, "timedelta64[ms]", 90.5, true],
+    [TimeUnit.MILLISECOND, "timedelta64[ms]", 90.0005, false],
+    [TimeUnit.MILLISECOND, "timedelta64[ms]", 9_223_372_036, true],
+    [TimeUnit.MILLISECOND, "timedelta64[ms]", 9_223_372_036.000_008, false],
+    [TimeUnit.MICROSECOND, "timedelta64[us]", 90.0005, true],
+    [TimeUnit.MICROSECOND, "timedelta64[us]", 90.0000005, false],
+    [TimeUnit.NANOSECOND, "timedelta64[ns]", 90.0000005, true],
+    [TimeUnit.NANOSECOND, "timedelta64[ns]", 90.0000000005, false],
+    // 105 days + 123 ns: past 2^53 ns, so the float second count is inexact.
+    [TimeUnit.NANOSECOND, "timedelta64[ns]", 9_072_000.000_000_123, true],
+  ])(
+    "validates %s duration precision for %p seconds",
+    (unit, numpyType, seconds, expected) => {
+      const mockColumn = getNumberColumn(getDurationArrowType(unit, numpyType))
+      expect(mockColumn.validateInput!(seconds)).toEqual(expected)
+    }
+  )
+
+  it("keeps copyData as the raw second count for duration formats", () => {
+    const mockColumn = getNumberColumn(MOCK_DURATION_ARROW_TYPE)
+    const cell = mockColumn.getCell(7200)
+    expect((cell as NumberCell).copyData).toEqual("7200")
+    expect(mockColumn.validateInput!(cell.copyData)).toBe(true)
+  })
+
+  it("revalidates duration precision after max_value correction", () => {
+    const mockColumn = getNumberColumn(
+      getDurationArrowType(TimeUnit.SECOND, "timedelta64[s]"),
+      { max_value: 90.5 }
+    )
+    // 100 clamps to 90.5, which timedelta64[s] cannot store.
+    expect(mockColumn.validateInput!(100)).toBe(false)
+    expect(mockColumn.validateInput!(90)).toBe(true)
+  })
+
+  it.each([
+    [TimeUnit.SECOND, "timedelta64[s]", 0],
+    [TimeUnit.MILLISECOND, "timedelta64[ms]", undefined],
+    [TimeUnit.NANOSECOND, "timedelta64[ns]", undefined],
+  ])(
+    "limits editor decimals for %s durations to what the unit stores",
+    (unit, numpyType, expectedFixedDecimals) => {
+      const mockColumn = getNumberColumn(getDurationArrowType(unit, numpyType))
+      const cell = mockColumn.getCell(90) as NumberCell
+      expect(cell.fixedDecimals).toEqual(expectedFixedDecimals)
+      expect(cell.displayData).toEqual("2 minutes")
+    }
+  )
+
+  it("rejects duration edits outside the pandas Timedelta range", () => {
+    const mockColumn = getNumberColumn(MOCK_DURATION_ARROW_TYPE)
+    expect(mockColumn.validateInput!(9_223_372_036)).toBe(true)
+    expect(mockColumn.validateInput!(9_223_372_036.854_776)).toBe(false)
+    expect(mockColumn.validateInput!(9_223_372_037)).toBe(false)
+    expect(mockColumn.validateInput!(-9_223_372_036.854_776)).toBe(false)
+    expect(mockColumn.validateInput!(-9_223_372_037)).toBe(false)
+  })
+
+  it("shows an error cell for NaN and the string form for infinite compact durations", () => {
+    const mockColumn = getNumberColumn(MOCK_DURATION_ARROW_TYPE, {
+      format: "compact",
+    })
+    expect(isErrorCell(mockColumn.getCell(Number.NaN))).toEqual(true)
+    expect(
+      (mockColumn.getCell(Number.POSITIVE_INFINITY) as NumberCell).displayData
+    ).toEqual("Infinity")
+    expect(
+      (mockColumn.getCell(Number.NEGATIVE_INFINITY) as NumberCell).displayData
+    ).toEqual("-Infinity")
+  })
+})

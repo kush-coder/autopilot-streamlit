@@ -1,0 +1,125 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { zip } from "lodash-es"
+
+import {
+  FileUploaderState as FileUploaderStateProto,
+  type FileURLs,
+  UploadedFileInfo as UploadedFileInfoProto,
+} from "@streamlit/protobuf"
+
+import type { FileUploadClient } from "~lib/FileUploadClient"
+import { ensureError } from "~lib/util/ErrorHandling"
+import type { WidgetInfo, WidgetStateManager } from "~lib/WidgetStateManager"
+
+type SuccessfulUpload = {
+  fileUrl: FileURLs.$Properties
+  file: File
+}
+
+type FailedUpload = {
+  file: File
+  error: Error
+}
+
+export const uploadFiles = async ({
+  files,
+  uploadClient,
+  widgetMgr,
+  widgetInfo,
+  fragmentId,
+  signal,
+  triggerRerun,
+}: {
+  files: File[]
+  uploadClient: FileUploadClient
+  widgetMgr: WidgetStateManager
+  widgetInfo: WidgetInfo
+  fragmentId?: string
+  signal?: AbortSignal
+  triggerRerun?: boolean
+}): Promise<{
+  successfulUploads: SuccessfulUpload[]
+  failedUploads: FailedUpload[]
+}> => {
+  let fileUrls: FileURLs.$Properties[]
+
+  try {
+    fileUrls = await uploadClient.fetchFileURLs(files)
+  } catch (e) {
+    return {
+      successfulUploads: [],
+      failedUploads: files.map(file => ({ file, error: ensureError(e) })),
+    }
+  }
+
+  const filesWithUrls = zip(files, fileUrls)
+
+  const successfulUploads: SuccessfulUpload[] = []
+  const failedUploads: FailedUpload[] = []
+
+  await Promise.all(
+    filesWithUrls.map(async ([file, fileUrl]) => {
+      if (!file || !fileUrl?.uploadUrl || !fileUrl.fileId) {
+        if (file) {
+          failedUploads.push({ file, error: new Error("No upload URL found") })
+        }
+        return undefined
+      }
+
+      try {
+        await uploadClient.uploadFile(
+          { id: fileUrl.fileId, formId: widgetInfo.formId ?? "" }, // TODO SEE IF DOWNSTREAM LOGIC CAN BE SIMPLIFIED
+          fileUrl.uploadUrl,
+          file,
+          undefined, // onUploadProgress
+          signal
+        )
+        successfulUploads.push({ fileUrl, file })
+      } catch (e) {
+        const error = ensureError(e)
+        failedUploads.push({ file, error })
+      }
+      return undefined
+    })
+  )
+
+  widgetMgr.setFileUploaderStateValue(
+    widgetInfo.id,
+    new FileUploaderStateProto({
+      uploadedFileInfo: successfulUploads.map(
+        ({ file, fileUrl }) =>
+          new UploadedFileInfoProto({
+            fileId: fileUrl.fileId,
+            fileUrls: fileUrl,
+            name: file.webkitRelativePath || file.name,
+            size: file.size,
+          })
+      ),
+    }),
+    {
+      formId: widgetInfo.formId,
+      fragmentId,
+      fromUser: true,
+      // WidgetStateManager reruns a user upload unless triggerRerun is false.
+      // Pass false to store this upload without a rerun; omit it otherwise.
+      ...(triggerRerun === false ? { triggerRerun: false } : {}),
+    }
+  )
+
+  return { successfulUploads, failedUploads }
+}

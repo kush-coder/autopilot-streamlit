@@ -1,0 +1,1180 @@
+/**
+ * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { forwardRef, useImperativeHandle } from "react"
+
+import { act, screen, waitFor } from "@testing-library/react"
+import { userEvent } from "@testing-library/user-event"
+import type { AxiosProgressEvent } from "axios"
+import { getLogger } from "loglevel"
+import createFetchMock from "vitest-fetch-mock"
+
+import {
+  CameraInput as CameraInputProto,
+  FileUploaderState as FileUploaderStateProto,
+  FileURLs as FileURLsProto,
+  LabelVisibility as LabelVisibilityProto,
+  UploadedFileInfo as UploadedFileInfoProto,
+} from "@streamlit/protobuf"
+
+import * as UseResizeObserver from "~lib/hooks/useResizeObserver"
+import { render } from "~lib/test_util"
+import * as IsMobile from "~lib/util/isMobile"
+import { WidgetStateManager } from "~lib/WidgetStateManager"
+
+import CameraInput, { type Props } from "./CameraInput"
+import { WebcamPermission } from "./WebcamComponent"
+
+const DEFAULT_SCREENSHOT = "data:image/jpeg;base64,mocked-photo"
+
+// Records the props passed to the (mocked) react-webcam on each render so tests
+// can assert how CameraInput's props flow through WebcamComponent, and sets
+// the screenshot its getScreenshot() returns.
+const webcamMock = vi.hoisted(() => ({
+  calls: [] as Array<Record<string, unknown>>,
+  screenshot: null as string | null,
+}))
+
+vi.mock("react-webcam", () => {
+  const MockWebcam = forwardRef((props, ref) => {
+    webcamMock.calls.push(props)
+    useImperativeHandle(ref, () => {
+      return {
+        getScreenshot: () => webcamMock.screenshot,
+      }
+    })
+
+    return <div data-testid="mockReactWebcam" />
+  })
+
+  return {
+    default: MockWebcam,
+  }
+})
+const fetchMocker = createFetchMock(vi)
+
+const buildFileUploaderStateProto = (
+  fileUrlsArray: FileURLsProto.$Properties[]
+): FileUploaderStateProto =>
+  new FileUploaderStateProto({
+    uploadedFileInfo: fileUrlsArray.map(
+      fileUrls =>
+        new UploadedFileInfoProto({
+          fileId: fileUrls.fileId,
+          fileUrls,
+          name: fileUrls.fileId,
+          size: 15,
+        })
+    ),
+  })
+
+const getProps = (
+  elementProps: Partial<CameraInputProto> = {},
+  props: Partial<Props> = {}
+): Props => {
+  return {
+    element: CameraInputProto.create({
+      id: "id",
+      label: "test_label",
+      help: "help",
+      formId: "",
+      ...elementProps,
+    }),
+    disabled: false,
+    widgetMgr: new WidgetStateManager({
+      sendRerunBackMsg: vi.fn(),
+      formsDataChanged: vi.fn(),
+    }),
+    // @ts-expect-error - upload client fixture does not implement FileUploadClient
+    uploadClient: {
+      uploadFile: vi.fn().mockImplementation(() => {
+        return Promise.resolve()
+      }),
+      fetchFileURLs: vi.fn().mockImplementation((acceptedFiles: File[]) => {
+        return Promise.resolve(
+          acceptedFiles.map(file => {
+            return new FileURLsProto({
+              fileId: file.name,
+              uploadUrl: file.name,
+              deleteUrl: file.name,
+            })
+          })
+        )
+      }),
+      deleteFile: vi.fn(),
+    },
+    ...props,
+  }
+}
+
+const takePhoto = async (): Promise<void> => {
+  await act(async () => {
+    screen.getByRole("button", { name: "Take Photo" }).click()
+    await vi.runAllTimersAsync()
+  })
+}
+
+/**
+ * Replace the upload client's uploadFile with one that stays pending until
+ * resolved or aborted, exposing its progress callback and abort signal.
+ */
+const mockPendingUpload = (
+  props: Props
+): {
+  reportProgress: (event: Partial<AxiosProgressEvent>) => void
+  resolveUpload: () => void
+  getSignal: () => AbortSignal | undefined
+} => {
+  let onProgress: (event: AxiosProgressEvent) => void = () => {}
+  let resolve: () => void = () => {}
+  let signal: AbortSignal | undefined
+
+  props.uploadClient.uploadFile = vi.fn(
+    (
+      _element: CameraInputProto,
+      _url: string,
+      _file: File,
+      progressCallback: (event: AxiosProgressEvent) => void,
+      abortSignal: AbortSignal
+    ) => {
+      onProgress = progressCallback
+      signal = abortSignal
+      return new Promise<void>((res, rej) => {
+        resolve = res
+        abortSignal.addEventListener("abort", () =>
+          rej(new DOMException("Aborted", "AbortError"))
+        )
+      })
+    }
+  )
+
+  return {
+    reportProgress: event =>
+      act(() => onProgress(event as AxiosProgressEvent)),
+    resolveUpload: () => resolve(),
+    getSignal: () => signal,
+  }
+}
+
+describe("CameraInput widget", () => {
+  fetchMocker.enableMocks()
+
+  beforeEach(() => {
+    // Use fake timers to control debounced functions in WebcamComponent
+    vi.useFakeTimers()
+    vi.spyOn(UseResizeObserver, "useResizeObserver").mockReturnValue({
+      elementRef: { current: null },
+      values: [250],
+    })
+    fetchMocker.resetMocks()
+    webcamMock.screenshot = DEFAULT_SCREENSHOT
+  })
+
+  afterEach(() => {
+    // Clean up timers to prevent "window is not defined" errors
+    // from debounced callbacks firing after test environment is torn down
+    vi.runOnlyPendingTimers()
+    vi.clearAllTimers()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  describe("rendering", () => {
+    it("renders without crashing", () => {
+      const props = getProps()
+      vi.spyOn(props.widgetMgr, "setFileUploaderStateValue")
+      render(<CameraInput {...props} />)
+      const cameraInput = screen.getByTestId("stCameraInput")
+      expect(cameraInput).toBeVisible()
+      expect(cameraInput).toHaveClass("stCameraInput")
+
+      expect(screen.getByText("Take Photo")).toBeVisible()
+      // WidgetStateManager should have been called on mounting
+      expect(props.widgetMgr.setFileUploaderStateValue).toHaveBeenCalledTimes(
+        1
+      )
+    })
+
+    it("shows a label", () => {
+      const props = getProps()
+      render(<CameraInput {...props} />)
+      expect(screen.getByTestId("stWidgetLabel")).toHaveTextContent(
+        props.element.label
+      )
+    })
+
+    it("pass labelVisibility prop to StyledWidgetLabel correctly when hidden", () => {
+      const props = getProps({
+        labelVisibility: {
+          value: LabelVisibilityProto.LabelVisibilityOptions.HIDDEN,
+        },
+      })
+      render(<CameraInput {...props} />)
+      expect(screen.getByTestId("stWidgetLabel")).toHaveStyle(
+        "visibility: hidden"
+      )
+    })
+
+    it("pass labelVisibility prop to StyledWidgetLabel correctly when collapsed", () => {
+      const props = getProps({
+        labelVisibility: {
+          value: LabelVisibilityProto.LabelVisibilityOptions.COLLAPSED,
+        },
+      })
+      render(<CameraInput {...props} />)
+      expect(screen.getByTestId("stWidgetLabel")).toHaveStyle("display: none")
+    })
+
+    it("shows help tooltip when provided", () => {
+      const props = getProps({ help: "This is a help tooltip" })
+      render(<CameraInput {...props} />)
+      // TooltipIcon should be present when help is provided
+      expect(screen.getByTestId("stTooltipIcon")).toBeVisible()
+    })
+
+    it("does not show help tooltip when not provided", () => {
+      const props = getProps({ help: "" })
+      render(<CameraInput {...props} />)
+      expect(screen.queryByTestId("stTooltipIcon")).not.toBeInTheDocument()
+    })
+  })
+
+  describe("widget state initialization", () => {
+    it("sets initial widget value on mount when undefined", () => {
+      const props = getProps()
+      vi.spyOn(props.widgetMgr, "setFileUploaderStateValue")
+
+      render(<CameraInput {...props} />)
+
+      expect(props.widgetMgr.setFileUploaderStateValue).toHaveBeenCalledTimes(
+        1
+      )
+      expect(props.widgetMgr.setFileUploaderStateValue).toHaveBeenCalledWith(
+        props.element.id,
+        buildFileUploaderStateProto([]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+    })
+
+    it("does not override existing widget value on mount", () => {
+      const props = getProps()
+      const existingState = buildFileUploaderStateProto([
+        {
+          fileId: "existing-photo.jpg",
+          uploadUrl: "existing-photo.jpg",
+          deleteUrl: "existing-photo.jpg",
+        },
+      ])
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        existingState,
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      vi.spyOn(props.widgetMgr, "setFileUploaderStateValue")
+
+      render(<CameraInput {...props} />)
+
+      // Should not be called again since value already exists
+      expect(props.widgetMgr.setFileUploaderStateValue).not.toHaveBeenCalled()
+    })
+
+    it("restores state from existing widget value", () => {
+      const props = getProps()
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "existing-photo.jpg",
+            uploadUrl: "existing-photo.jpg",
+            deleteUrl: "existing-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+
+      // When there's an existing file, the Clear photo button should be shown
+      // (since imgSrc would be RESTORED_FROM_WIDGET_STRING)
+      expect(screen.getByText("Clear photo")).toBeVisible()
+    })
+
+    it("shows the webcam when the existing widget value has no files", () => {
+      const props = getProps()
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+      vi.spyOn(props.widgetMgr, "setFileUploaderStateValue")
+
+      render(<CameraInput {...props} />)
+
+      expect(screen.getByTestId("stCameraInputWebcamComponent")).toBeVisible()
+      expect(screen.queryByText("Clear photo")).not.toBeInTheDocument()
+      expect(props.widgetMgr.setFileUploaderStateValue).not.toHaveBeenCalled()
+    })
+
+    it("passes fragmentId to setFileUploaderStateValue", () => {
+      const props = getProps({}, { fragmentId: "myFragmentId" })
+      vi.spyOn(props.widgetMgr, "setFileUploaderStateValue")
+
+      render(<CameraInput {...props} />)
+
+      expect(props.widgetMgr.setFileUploaderStateValue).toHaveBeenCalledWith(
+        props.element.id,
+        expect.any(Object),
+        {
+          formId: props.element.formId,
+          fragmentId: "myFragmentId",
+          fromUser: false,
+        }
+      )
+    })
+  })
+
+  describe("webcam component", () => {
+    it("shows webcam component when no photo is captured", () => {
+      const props = getProps()
+      render(<CameraInput {...props} />)
+
+      expect(screen.getByTestId("stCameraInputWebcamComponent")).toBeVisible()
+      expect(screen.getByText("Take Photo")).toBeVisible()
+    })
+
+    it("passes disabled prop to webcam component", () => {
+      const props = getProps({}, { disabled: true })
+      render(<CameraInput {...props} />)
+
+      const takePhotoButton = screen.getByRole("button", {
+        name: "Take Photo",
+      })
+      expect(takePhotoButton).toBeDisabled()
+    })
+
+    it("passes width to webcam component", () => {
+      vi.spyOn(UseResizeObserver, "useResizeObserver").mockReturnValue({
+        elementRef: { current: null },
+        values: [400],
+      })
+      const props = getProps()
+      render(<CameraInput {...props} />)
+
+      // WebcamComponent should be rendered with the width
+      const webcamBox = screen.getByTestId("stCameraInputWebcamStyledBox")
+      expect(webcamBox).toBeInTheDocument()
+    })
+  })
+
+  describe("photo capture", () => {
+    it("shows Take Photo button when webcam permission is granted", () => {
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+
+      render(<CameraInput {...props} />)
+
+      // Take Photo button should be visible
+      const takePhotoButton = screen.getByRole("button", {
+        name: "Take Photo",
+      })
+      expect(takePhotoButton).toBeVisible()
+    })
+
+    it("Take Photo button is enabled when webcam permission is granted", () => {
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+
+      render(<CameraInput {...props} />)
+
+      const takePhotoButton = screen.getByRole("button", {
+        name: "Take Photo",
+      })
+      // Button should be enabled when webcam permission is granted
+      expect(takePhotoButton).not.toBeDisabled()
+    })
+
+    it("coalesces overlapping captures into a single upload flow", async () => {
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+      fetchMocker.mockResponse("")
+
+      render(<CameraInput {...props} />)
+
+      const takePhotoButton = screen.getByRole("button", {
+        name: "Take Photo",
+      })
+
+      await act(async () => {
+        // Trigger two captures in one turn before React applies UI transition.
+        takePhotoButton.click()
+        takePhotoButton.click()
+        await vi.runAllTimersAsync()
+      })
+
+      expect(props.uploadClient.fetchFileURLs).toHaveBeenCalledTimes(1)
+      expect(props.uploadClient.uploadFile).toHaveBeenCalledTimes(1)
+    })
+
+    it("does nothing when the webcam returns no screenshot", async () => {
+      webcamMock.screenshot = null
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+
+      render(<CameraInput {...props} />)
+      await takePhoto()
+
+      expect(props.uploadClient.fetchFileURLs).not.toHaveBeenCalled()
+      expect(screen.queryByRole("img", { name: "Snapshot" })).toBeNull()
+      expect(screen.getByRole("button", { name: "Take Photo" })).toBeVisible()
+    })
+  })
+
+  describe("clear photo", () => {
+    it("shows Clear photo button when image is captured", () => {
+      const props = getProps()
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "test-photo.jpg",
+            uploadUrl: "test-photo.jpg",
+            deleteUrl: "test-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+
+      expect(screen.getByText("Clear photo")).toBeVisible()
+    })
+
+    it("clears photo when Clear photo button is clicked", async () => {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+      const props = getProps()
+      vi.spyOn(props.widgetMgr, "setFileUploaderStateValue")
+
+      // Set initial state with a photo
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "test-photo.jpg",
+            uploadUrl: "test-photo.jpg",
+            deleteUrl: "test-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+
+      const clearButton = screen.getByRole("button", { name: /Clear photo/i })
+      await user.click(clearButton)
+
+      // After clearing, the webcam should be shown again
+      await waitFor(() => {
+        expect(
+          screen.getByTestId("stCameraInputWebcamComponent")
+        ).toBeVisible()
+      })
+
+      // Widget state should be updated with empty files
+      expect(props.widgetMgr.setFileUploaderStateValue).toHaveBeenCalledWith(
+        props.element.id,
+        buildFileUploaderStateProto([]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: true,
+        }
+      )
+    })
+
+    it("calls deleteFile when clearing uploaded photo", async () => {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+      const props = getProps()
+
+      // Set initial state with a photo
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "test-photo.jpg",
+            uploadUrl: "test-photo.jpg",
+            deleteUrl: "test-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+
+      const clearButton = screen.getByRole("button", { name: /Clear photo/i })
+      await user.click(clearButton)
+
+      // deleteFile should be called with the delete URL
+      await waitFor(() => {
+        expect(props.uploadClient.deleteFile).toHaveBeenCalledWith(
+          "test-photo.jpg"
+        )
+      })
+    })
+
+    it("disables Clear photo button during upload", () => {
+      const props = getProps()
+
+      // Set initial state with a photo (restored from widget)
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "test-photo.jpg",
+            uploadUrl: "test-photo.jpg",
+            deleteUrl: "test-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+
+      const clearButton = screen.getByRole("button", { name: /Clear photo/i })
+      // When not uploading, button should not be disabled
+      expect(clearButton).not.toBeDisabled()
+    })
+
+    it("disables Clear photo button when component is disabled", () => {
+      const props = getProps({}, { disabled: true })
+
+      // Set initial state with a photo
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "test-photo.jpg",
+            uploadUrl: "test-photo.jpg",
+            deleteUrl: "test-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+
+      const clearButton = screen.getByRole("button", { name: /Clear photo/i })
+      expect(clearButton).toBeDisabled()
+    })
+  })
+
+  describe("form behavior", () => {
+    it("resets state when form is cleared", async () => {
+      const props = getProps({ formId: "form-id" })
+      vi.spyOn(props.widgetMgr, "setFileUploaderStateValue")
+
+      props.widgetMgr.setFormSubmitBehaviors("form-id", true)
+
+      // Set initial state with a photo
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "test-photo.jpg",
+            uploadUrl: "test-photo.jpg",
+            deleteUrl: "test-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+
+      // Verify we have the captured photo state
+      expect(screen.getByText("Clear photo")).toBeVisible()
+
+      // Submit the form (which should clear the widget)
+      act(() => {
+        props.widgetMgr.submitForm("form-id", undefined)
+      })
+
+      // After form submission, webcam should be shown again
+      await waitFor(() => {
+        expect(
+          screen.getByTestId("stCameraInputWebcamComponent")
+        ).toBeVisible()
+      })
+
+      // Widget state should be updated with empty files
+      expect(props.widgetMgr.setFileUploaderStateValue).toHaveBeenCalledWith(
+        props.element.id,
+        buildFileUploaderStateProto([]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: true,
+        }
+      )
+    })
+
+    it("ignores an upload that completes after the form was cleared", async () => {
+      const props = getProps(
+        { formId: "form-id" },
+        { testOverride: WebcamPermission.SUCCESS }
+      )
+      props.widgetMgr.setFormSubmitBehaviors("form-id", true)
+      fetchMocker.mockResponse("")
+      const { resolveUpload } = mockPendingUpload(props)
+
+      render(<CameraInput {...props} />)
+      await takePhoto()
+      expect(
+        screen.getByRole("button", { name: /Uploading\.\.\./ })
+      ).toBeVisible()
+
+      act(() => {
+        props.widgetMgr.submitForm("form-id", undefined)
+      })
+      await act(async () => {
+        resolveUpload()
+        await vi.runAllTimersAsync()
+      })
+
+      expect(screen.getByTestId("stCameraInputWebcamComponent")).toBeVisible()
+      expect(screen.queryByText("Clear photo")).not.toBeInTheDocument()
+      expect(
+        props.widgetMgr.getFileUploaderStateValue(props.element)
+          ?.uploadedFileInfo
+      ).toEqual([])
+    })
+  })
+
+  describe("on_change='ignore' mode", () => {
+    // Let a scheduled rerun flush before asserting whether one was sent.
+    // This suite uses fake timers, so do not use a real setTimeout(0).
+    async function flushScheduledRerun(): Promise<void> {
+      await act(async () => {
+        await vi.runAllTimersAsync()
+      })
+    }
+
+    function createWidgetMgrWithRerunSpy(): {
+      widgetMgr: WidgetStateManager
+      sendRerunBackMsg: ReturnType<typeof vi.fn>
+    } {
+      const sendRerunBackMsg = vi.fn()
+      const widgetMgr = new WidgetStateManager({
+        sendRerunBackMsg,
+        formsDataChanged: vi.fn(),
+      })
+      return { widgetMgr, sendRerunBackMsg }
+    }
+
+    it("passes triggerRerun: false when ignoreRerun is true", async () => {
+      const { widgetMgr, sendRerunBackMsg } = createWidgetMgrWithRerunSpy()
+      const props = getProps(
+        { ignoreRerun: true },
+        { widgetMgr, testOverride: WebcamPermission.SUCCESS }
+      )
+      fetchMocker.mockResponse("")
+      const setFileUploaderStateValueSpy = vi.spyOn(
+        props.widgetMgr,
+        "setFileUploaderStateValue"
+      )
+
+      render(<CameraInput {...props} />)
+      setFileUploaderStateValueSpy.mockClear()
+      sendRerunBackMsg.mockClear()
+
+      const takePhotoButton = screen.getByRole("button", {
+        name: "Take Photo",
+      })
+      await act(async () => {
+        takePhotoButton.click()
+        await vi.runAllTimersAsync()
+      })
+
+      await waitFor(() => {
+        expect(setFileUploaderStateValueSpy).toHaveBeenCalled()
+      })
+      expect(setFileUploaderStateValueSpy).toHaveBeenLastCalledWith(
+        props.element.id,
+        expect.anything(),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: true,
+          triggerRerun: false,
+        }
+      )
+      await flushScheduledRerun()
+      expect(sendRerunBackMsg).not.toHaveBeenCalled()
+      expect(screen.getByText("Clear photo")).toBeVisible()
+    })
+
+    it("does not pass triggerRerun when ignoreRerun is false", async () => {
+      const { widgetMgr, sendRerunBackMsg } = createWidgetMgrWithRerunSpy()
+      const props = getProps(
+        { ignoreRerun: false },
+        { widgetMgr, testOverride: WebcamPermission.SUCCESS }
+      )
+      fetchMocker.mockResponse("")
+      const setFileUploaderStateValueSpy = vi.spyOn(
+        props.widgetMgr,
+        "setFileUploaderStateValue"
+      )
+
+      render(<CameraInput {...props} />)
+      setFileUploaderStateValueSpy.mockClear()
+      sendRerunBackMsg.mockClear()
+
+      const takePhotoButton = screen.getByRole("button", {
+        name: "Take Photo",
+      })
+      await act(async () => {
+        takePhotoButton.click()
+        await vi.runAllTimersAsync()
+      })
+
+      await waitFor(() => {
+        expect(setFileUploaderStateValueSpy).toHaveBeenCalled()
+      })
+      expect(setFileUploaderStateValueSpy).toHaveBeenLastCalledWith(
+        props.element.id,
+        expect.anything(),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: true,
+        }
+      )
+      await flushScheduledRerun()
+      expect(sendRerunBackMsg).toHaveBeenCalled()
+    })
+
+    it("passes triggerRerun: false when a captured photo is cleared", async () => {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+      const { widgetMgr, sendRerunBackMsg } = createWidgetMgrWithRerunSpy()
+      const props = getProps({ ignoreRerun: true }, { widgetMgr })
+      const setFileUploaderStateValueSpy = vi.spyOn(
+        props.widgetMgr,
+        "setFileUploaderStateValue"
+      )
+
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "test-photo.jpg",
+            uploadUrl: "test-photo.jpg",
+            deleteUrl: "test-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+      setFileUploaderStateValueSpy.mockClear()
+      sendRerunBackMsg.mockClear()
+
+      const clearButton = screen.getByRole("button", { name: /Clear photo/i })
+      await user.click(clearButton)
+
+      await waitFor(() => {
+        expect(setFileUploaderStateValueSpy).toHaveBeenCalled()
+      })
+      expect(setFileUploaderStateValueSpy).toHaveBeenLastCalledWith(
+        props.element.id,
+        buildFileUploaderStateProto([]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: true,
+          triggerRerun: false,
+        }
+      )
+      await flushScheduledRerun()
+      expect(sendRerunBackMsg).not.toHaveBeenCalled()
+    })
+
+    it("does not change form batching when ignoreRerun is true", async () => {
+      const sendRerunBackMsg = vi.fn()
+      let pendingFormIds = new Set<string>()
+      const widgetMgr = new WidgetStateManager({
+        sendRerunBackMsg,
+        formsDataChanged: vi.fn(newData => {
+          pendingFormIds = newData.formsWithPendingChanges
+        }),
+      })
+      const props = getProps(
+        {
+          ignoreRerun: true,
+          formId: "testForm",
+        },
+        { widgetMgr, testOverride: WebcamPermission.SUCCESS }
+      )
+      fetchMocker.mockResponse("")
+      const setFileUploaderStateValueSpy = vi.spyOn(
+        props.widgetMgr,
+        "setFileUploaderStateValue"
+      )
+
+      render(<CameraInput {...props} />)
+      setFileUploaderStateValueSpy.mockClear()
+      sendRerunBackMsg.mockClear()
+
+      const takePhotoButton = screen.getByRole("button", {
+        name: "Take Photo",
+      })
+      await act(async () => {
+        takePhotoButton.click()
+        await vi.runAllTimersAsync()
+      })
+
+      await waitFor(() => {
+        expect(setFileUploaderStateValueSpy).toHaveBeenCalled()
+      })
+      expect(setFileUploaderStateValueSpy).toHaveBeenLastCalledWith(
+        props.element.id,
+        expect.anything(),
+        {
+          formId: "testForm",
+          fragmentId: undefined,
+          fromUser: true,
+          triggerRerun: false,
+        }
+      )
+      await flushScheduledRerun()
+      expect(sendRerunBackMsg).not.toHaveBeenCalled()
+      expect(pendingFormIds).toEqual(new Set(["testForm"]))
+    })
+  })
+
+  describe("disabled state", () => {
+    it("disables Take Photo button when disabled", () => {
+      const props = getProps({}, { disabled: true })
+      render(<CameraInput {...props} />)
+
+      const takePhotoButton = screen.getByRole("button", {
+        name: "Take Photo",
+      })
+      expect(takePhotoButton).toBeDisabled()
+    })
+
+    it("shows disabled webcam when component is disabled", () => {
+      const props = getProps({}, { disabled: true })
+      render(<CameraInput {...props} />)
+
+      expect(screen.getByTestId("stCameraInputWebcamComponent")).toBeVisible()
+    })
+  })
+
+  describe("upload handling", () => {
+    it("handles upload error gracefully", () => {
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+      props.uploadClient.uploadFile = vi
+        .fn()
+        .mockRejectedValue(new Error("upload failed"))
+
+      render(<CameraInput {...props} />)
+
+      // Component should render without crashing even with upload errors
+      expect(screen.getByText("Take Photo")).toBeVisible()
+    })
+
+    it("handles fetchFileURLs error gracefully", () => {
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+      props.uploadClient.fetchFileURLs = vi
+        .fn()
+        .mockRejectedValue(new Error("fetch URLs failed"))
+
+      render(<CameraInput {...props} />)
+
+      // Component should render without crashing
+      expect(screen.getByText("Take Photo")).toBeVisible()
+    })
+
+    it("shows upload progress until the upload completes", async () => {
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+      fetchMocker.mockResponse("")
+      const { reportProgress, resolveUpload } = mockPendingUpload(props)
+
+      render(<CameraInput {...props} />)
+      await takePhoto()
+
+      reportProgress({ loaded: 50, total: 100 })
+
+      expect(screen.getByRole("progressbar")).toHaveAttribute(
+        "aria-valuenow",
+        "50"
+      )
+      expect(
+        screen.getByRole("button", { name: /Uploading\.\.\./ })
+      ).toBeDisabled()
+      expect(screen.queryByText("Clear photo")).not.toBeInTheDocument()
+
+      await act(async () => {
+        resolveUpload()
+        await vi.runAllTimersAsync()
+      })
+      // CameraInput ignores progress reported after the upload completes.
+      reportProgress({ loaded: 75, total: 100 })
+
+      expect(screen.queryByRole("progressbar")).not.toBeInTheDocument()
+      expect(
+        screen.getByRole("button", { name: /Clear photo/i })
+      ).not.toBeDisabled()
+      expect(
+        props.widgetMgr.getFileUploaderStateValue(props.element)
+          ?.uploadedFileInfo
+      ).toHaveLength(1)
+    })
+
+    it("aborts the upload when Clear photo is clicked while upload progress is unknown", async () => {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+      fetchMocker.mockResponse("")
+      const { reportProgress, getSignal } = mockPendingUpload(props)
+
+      render(<CameraInput {...props} />)
+      await takePhoto()
+
+      // Relies on a progress event without a total reporting 0%, which shows
+      // Clear photo while the upload is still running. Update this setup if
+      // that behavior changes.
+      reportProgress({ loaded: 10 })
+
+      await user.click(screen.getByRole("button", { name: /Clear photo/i }))
+
+      expect(getSignal()?.aborted).toBe(true)
+      expect(props.uploadClient.deleteFile).not.toHaveBeenCalled()
+      expect(screen.getByTestId("stCameraInputWebcamComponent")).toBeVisible()
+      expect(screen.queryByRole("img", { name: "Snapshot" })).toBeNull()
+    })
+
+    it("does not store the photo when the upload fails", async () => {
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+      fetchMocker.mockResponse("")
+      props.uploadClient.uploadFile = vi
+        .fn()
+        .mockRejectedValue(new Error("upload failed"))
+
+      render(<CameraInput {...props} />)
+      await takePhoto()
+
+      expect(props.uploadClient.uploadFile).toHaveBeenCalledTimes(1)
+      expect(screen.getByRole("img", { name: "Snapshot" })).toBeVisible()
+      expect(
+        screen.getByRole("button", { name: /Clear photo/i })
+      ).not.toBeDisabled()
+      expect(
+        screen.queryByRole("button", { name: /Uploading\.\.\./ })
+      ).not.toBeInTheDocument()
+      expect(
+        props.widgetMgr.getFileUploaderStateValue(props.element)
+          ?.uploadedFileInfo
+      ).toEqual([])
+    })
+
+    it("logs an error and skips the upload when fetching file URLs fails", async () => {
+      const logErrorSpy = vi
+        .spyOn(getLogger("CameraInput"), "error")
+        .mockImplementation(() => {})
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+      fetchMocker.mockResponse("")
+      const error = new Error("fetch URLs failed")
+      props.uploadClient.fetchFileURLs = vi.fn().mockRejectedValue(error)
+
+      render(<CameraInput {...props} />)
+      await takePhoto()
+
+      expect(logErrorSpy).toHaveBeenCalledWith(error)
+      expect(props.uploadClient.uploadFile).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("image display", () => {
+    it("shows StyledBox with correct width", () => {
+      vi.spyOn(UseResizeObserver, "useResizeObserver").mockReturnValue({
+        elementRef: { current: null },
+        values: [300],
+      })
+
+      const props = getProps()
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "test-photo.jpg",
+            uploadUrl: "test-photo.jpg",
+            deleteUrl: "test-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+
+      // The StyledBox should be rendered when there's a captured image
+      // (with RESTORED_FROM_WIDGET_STRING, image is not shown but box is)
+      expect(screen.getByText("Clear photo")).toBeVisible()
+    })
+
+    it("does not display image when imgSrc is RESTORED_FROM_WIDGET_STRING", () => {
+      const props = getProps()
+      props.widgetMgr.setFileUploaderStateValue(
+        props.element.id,
+        buildFileUploaderStateProto([
+          {
+            fileId: "test-photo.jpg",
+            uploadUrl: "test-photo.jpg",
+            deleteUrl: "test-photo.jpg",
+          },
+        ]),
+        {
+          formId: props.element.formId,
+          fragmentId: undefined,
+          fromUser: false,
+        }
+      )
+
+      render(<CameraInput {...props} />)
+
+      // Image should not be present when restored from widget
+      expect(screen.queryByRole("img", { name: "Snapshot" })).toBeNull()
+      // But Clear photo button should be present
+      expect(screen.getByText("Clear photo")).toBeVisible()
+    })
+  })
+
+  describe("mobile facing mode", () => {
+    it("starts with USER facing mode by default", () => {
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+      render(<CameraInput {...props} />)
+
+      // Component renders with default facing mode (user)
+      expect(screen.getByTestId("stCameraInputWebcamComponent")).toBeVisible()
+    })
+
+    it("toggles between front and back camera on mobile", async () => {
+      vi.spyOn(IsMobile, "isMobile").mockReturnValue(true)
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+      const props = getProps({}, { testOverride: WebcamPermission.SUCCESS })
+      render(<CameraInput {...props} />)
+
+      const switchButton = screen.getByRole("button", {
+        name: "Switch camera",
+      })
+      expect(webcamMock.calls.at(-1)?.videoConstraints).toMatchObject({
+        facingMode: "user",
+      })
+
+      await user.click(switchButton)
+      expect(webcamMock.calls.at(-1)?.videoConstraints).toMatchObject({
+        facingMode: "environment",
+      })
+
+      await user.click(switchButton)
+      expect(webcamMock.calls.at(-1)?.videoConstraints).toMatchObject({
+        facingMode: "user",
+      })
+
+      // Flush the hover tooltip's delayed state update inside act().
+      await act(async () => {
+        await vi.runAllTimersAsync()
+      })
+    })
+  })
+
+  describe("resolution height forwarding", () => {
+    beforeEach(() => {
+      webcamMock.calls.length = 0
+    })
+
+    it("forwards resolutionHeight as a height-only capture constraint", () => {
+      const props = getProps({ resolutionHeight: 720 })
+      render(<CameraInput {...props} />)
+
+      // The proto field reaches WebcamComponent, which turns it into a
+      // height-only getUserMedia constraint and forces the screenshot to use
+      // the stream's intrinsic size.
+      const webcamProps = webcamMock.calls.at(-1)
+      expect(webcamProps?.forceScreenshotSourceSize).toBe(true)
+      expect(webcamProps?.videoConstraints).toMatchObject({
+        height: { ideal: 720 },
+      })
+      expect(webcamProps?.videoConstraints).not.toHaveProperty("width")
+    })
+
+    it("omits the resolution constraint when the proto field is absent", () => {
+      const props = getProps({})
+      render(<CameraInput {...props} />)
+
+      // Without a resolution, capture falls back to the display-width hint and
+      // the screenshot uses the displayed element size.
+      const webcamProps = webcamMock.calls.at(-1)
+      expect(webcamProps?.forceScreenshotSourceSize).toBe(false)
+      expect(webcamProps?.videoConstraints).toMatchObject({
+        width: { ideal: expect.any(Number) },
+      })
+      expect(webcamProps?.videoConstraints).not.toHaveProperty("height")
+    })
+  })
+})

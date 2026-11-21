@@ -1,0 +1,73 @@
+<!--
+ Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, shrink-to-fit=no"
+    />
+    <link rel="shortcut icon" href="/favicon.png" />
+    <link
+      rel="preload"
+      href="./static/media/SourceSansVF-Upright.ttf.BsWL4Kly.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+
+    <title>Streamlit</title>
+
+    <!--
+      Machine-readable pointer to the agent API's own description, per RFC 8631.
+      Always present: the endpoint answers whether or not the API is enabled, so
+      following this link reports which, and enabling it needs no HTML change.
+      Relative, like the static assets, so it resolves under a base URL path or
+      a hosting prefix.
+    -->
+    <link rel="service-desc" href="./_stcore/agent/openapi.json" />
+
+    <!-- initialize window.prerenderReady to false and then set to true in React app when app is ready for indexing -->
+    <script>
+      window.prerenderReady = false
+    </script>
+  </head>
+  <body>
+    <noscript>
+      <p>You need to enable JavaScript to run this app.</p>
+      <p>
+        Reading this without a browser? A Streamlit app can also offer its
+        contents and interactions as JSON over HTTP, the recommended way for AI
+        agents and other programs to use it without a browser. This page is an
+        empty shell until JavaScript renders the app's content into it.
+      </p>
+      <p>
+        The protocol is described at
+        <a href="./_stcore/agent/openapi.json">_stcore/agent/openapi.json</a>
+        under the app's root URL, not under a page's URL. That document also
+        says whether this app offers it. The protocol has one HTTP operation,
+        <code>POST _stcore/agent/interact</code>: a JSON body of
+        <code>{}</code> starts a session and returns the app's contents as
+        JSON. The same protocol is also an MCP server at
+        <code>_stcore/agent/mcp</code> under the app's root URL.
+      </p>
+    </noscript>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>

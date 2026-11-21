@@ -1,0 +1,393 @@
+# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2026)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+from pathlib import Path
+
+import altair as alt
+import numpy as np
+import pandas as pd
+from vega_datasets import data
+
+import streamlit as st
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+np.random.seed(0)
+
+# mark_arc was added in 4.2, but we have to support altair 4.0-4.1, so we
+# have to skip this part of the test when testing min versions.
+major, minor, patch = alt.__version__.split(".")
+if not (major == "4" and minor < "2"):
+    source = pd.DataFrame(
+        {"category": [1, 2, 3, 4, 5, 6], "value": [4, 6, 10, 3, 7, 8]}
+    )
+
+    chart = (
+        alt.Chart(source)
+        .mark_arc(innerRadius=50)
+        .encode(
+            theta=alt.Theta(field="value", type="quantitative"),
+            color=alt.Color(field="category", type="nominal"),
+        )
+    )
+
+    st.write("Pie Chart with more than 4 Legend items")
+    st.altair_chart(chart, theme="streamlit", width="content")
+
+
+df1 = pd.DataFrame(np.random.randn(200, 3), columns=["a", "b", "c"])
+chart = alt.Chart(df1).mark_circle().encode(x="a", y="b", size="c", color="c")
+
+st.write("Show default vega lite theme:")
+st.altair_chart(chart, theme=None)
+
+st.write("Show streamlit theme:")
+st.altair_chart(chart, theme="streamlit")
+
+st.write("Overwrite theme config:")
+chart = (
+    alt.Chart(df1, usermeta={"embedOptions": {"theme": None}})
+    .mark_circle()
+    .encode(x="a", y="b", size="c", color="c")
+)
+st.altair_chart(chart, theme="streamlit")
+
+df2 = pd.DataFrame(
+    {
+        "a": ["A", "B", "C", "D", "E", "F", "G", "H", "I"],
+        "b": [28, 55, 43, 91, 81, 53, 19, 87, 52],
+    }
+)
+
+chart = alt.Chart(df2).mark_bar().encode(x="a", y="b")
+
+st.write("Bar chart with overwritten theme props:")
+st.altair_chart(chart.configure_mark(color="black"), theme="streamlit")
+
+# taken from vega_datasets barley example
+barley = alt.UrlData(
+    "https://cdn.jsdelivr.net/npm/vega-datasets@v2.7.0/data/barley.json"
+)
+
+barley_chart = (
+    alt.Chart(barley)
+    .mark_bar()
+    .encode(x="year:O", y="sum(yield):Q", color="year:N", column="site:N")
+)
+
+# TODO(lukasmasuch): This chart causes some flickering in webkit & chromium.
+# This points to an actual bug or issue that needs more investigation.
+# st.write("Grouped Bar Chart with default theme:")  # noqa: ERA001
+# st.altair_chart(barley_chart, theme=None)  # noqa: ERA001
+
+# st.write("Grouped Bar Chart with streamlit theme:")  # noqa: ERA001
+# st.altair_chart(barley_chart, theme="streamlit")  # noqa: ERA001
+
+# st.write( "Grouped Bar Chart with use_container_width=True (note that this doesn't work well)")  # noqa: ERA001
+# st.altair_chart(barley_chart, theme=None, use_container_width=True)  # noqa: ERA001
+
+st.write("Layered chart")
+# Taken from vega_datasets
+stocks = alt.UrlData(
+    "https://cdn.jsdelivr.net/npm/vega-datasets@v1.29.0/data/stocks.csv"
+)
+
+base = (
+    alt.Chart(stocks)
+    .encode(x="date:T", y="price:Q", color="symbol:N")
+    .transform_filter(alt.datum.symbol == "GOOG")
+)
+
+new_base_chart = base.mark_line() + base.mark_point()
+st.altair_chart(new_base_chart)
+
+x = np.linspace(10, 100, 10)
+y1 = 5 * x
+y2 = 1 / x
+
+df3 = pd.DataFrame.from_dict({"x": x, "y1": y1, "y2": y2})
+
+c1 = alt.Chart(df3).mark_line().encode(alt.X("x"), alt.Y("y1"))
+
+c2 = alt.Chart(df3).mark_line().encode(alt.X("x"), alt.Y("y2"))
+
+st.altair_chart(c1 & c2)
+
+# Issue #9339: legend.title=None shouldn't cut chart off
+df_cut_off_issue = pd.DataFrame(
+    {
+        "x": [1, 2, 3, 4],
+        "y": [10, 20, 30, 40],
+        "category": ["A", "B", "C", "D"],
+    }
+)
+
+cut_off_chart = (
+    alt.Chart(df_cut_off_issue)
+    .mark_line(point=True)
+    .encode(
+        x=alt.X("x", title="Date"),
+        y=alt.Y("y:Q", title="Value"),
+        color=alt.Color("category:N").legend(orient="bottom", title=None),
+    )
+)
+
+st.write("Altair chart cut off if legend title is None (Issue #9339)")
+st.altair_chart(cut_off_chart)
+
+# Issue #13410: Scatter plot with marginal histograms (nested vconcat+hconcat)
+st.write("Scatter plot with marginal histograms")
+
+# Create a scatter plot with marginal histograms using the pattern: top_hist & (points | right_hist)
+# This creates a vconcat containing hconcat, which was broken in v1.42+
+source = data.iris()
+base = alt.Chart(source)
+
+xscale = alt.Scale(domain=(4.0, 8.0))
+yscale = alt.Scale(domain=(1.9, 4.55))
+
+bar_args = {"opacity": 0.3, "binSpacing": 0}
+
+points = base.mark_circle().encode(
+    alt.X("sepalLength", scale=xscale),
+    alt.Y("sepalWidth", scale=yscale),
+    color="species",
+)
+
+top_hist = (
+    base.mark_bar(**bar_args)  # type: ignore[arg-type]
+    .encode(
+        alt.X(
+            "sepalLength:Q",
+            bin=alt.Bin(maxbins=20, extent=xscale.domain),
+            stack=None,
+            title="",
+        ),
+        alt.Y("count()", stack=None, title=""),
+        alt.Color("species:N"),
+    )
+    .properties(height=60)
+)
+
+right_hist = (
+    base.mark_bar(**bar_args)  # type: ignore[arg-type]
+    .encode(
+        alt.Y(
+            "sepalWidth:Q",
+            bin=alt.Bin(maxbins=20, extent=yscale.domain),
+            stack=None,
+            title="",
+        ),
+        alt.X("count()", stack=None, title=""),
+        alt.Color("species:N"),
+    )
+    .properties(width=60)
+)
+
+marginal_hist_chart = top_hist & (points | right_hist)
+st.altair_chart(marginal_hist_chart, theme="streamlit")
+
+# Regression scenario for https://github.com/streamlit/streamlit/issues/13974:
+# layered child inside vconcat with explicit autosize=fit-x and width=stretch.
+st.write("Regression: Layered vconcat chart with autosize=fit-x and width=stretch")
+df_regression = pd.DataFrame(
+    np.random.default_rng(0).standard_normal((60, 2)), columns=["a", "b"]
+)
+base_regression = (
+    alt.Chart(df_regression)
+    .mark_circle()
+    .encode(x="a", y="b")
+    .properties(width=400, height=200)
+)
+text_regression = base_regression.mark_text(dy=-10).encode(
+    text=alt.Text("b:Q", format=".1f")
+)
+regression_chart = (base_regression + text_regression) & base_regression
+regression_chart = regression_chart.properties(autosize="fit-x")
+st.altair_chart(regression_chart, width="stretch")
+
+# Regression scenario for https://github.com/streamlit/streamlit/issues/14050:
+# vconcat of layered + faceted children with width=stretch should render.
+st.write("Regression: vconcat of layered faceted charts with width=stretch")
+df_issue_14050 = pd.DataFrame(
+    {
+        "group": ["x", "x", "x", "y", "y", "y", "z", "z", "z"],
+        "bin": [1, 2, 3, 1, 2, 3, 1, 2, 3],
+        "xval": [10, 20, 30, 12, 22, 32, 14, 24, 34],
+        "y1": [4, 6, 8, 5, 7, 9, 6, 8, 10],
+        "y2": [2, 3, 5, 2.5, 3.5, 5.5, 3, 4, 6],
+        "selected": [False, True, False, False, True, False, False, True, False],
+    }
+)
+
+
+def _faceted_layer(metric: str, title: str) -> alt.FacetChart:
+    base_layer = (
+        alt.Chart(df_issue_14050)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("xval:Q", axis=alt.Axis(title="xval")),
+            y=alt.Y(f"{metric}:Q", axis=alt.Axis(title=title)),
+            color=alt.Color("group:N", legend=alt.Legend(title="Group")),
+            tooltip=["group", "bin", "xval", metric],
+        )
+    )
+    selected_layer = (
+        alt.Chart(df_issue_14050)
+        .mark_point(shape="diamond", color="purple", filled=True, size=90)
+        .encode(x=alt.X("xval:Q"), y=alt.Y(f"{metric}:Q"))
+        .transform_filter(alt.datum.selected)
+    )
+    return alt.layer(base_layer, selected_layer).facet(column=alt.Column("bin:O"))
+
+
+issue_14050_chart = (
+    alt.vconcat(
+        _faceted_layer("y1", "y1"),
+        _faceted_layer("y2", "y2"),
+    )
+    .resolve_scale(x="independent", y="independent")
+    .properties(title="Issue #14050 regression chart")
+)
+st.altair_chart(issue_14050_chart, width="stretch")
+
+# Parameter-binding widgets (range, select, radio, checkbox, text) render as
+# native HTML controls inside the chart. The frontend themes them because
+# vega-embed's default CSS is disabled.
+st.write("Altair chart with parameter bindings")
+df_bindings = pd.DataFrame(
+    {
+        "Horsepower": [130, 165, 150, 88, 95, 113],
+        "Miles_per_Gallon": [18, 15, 18, 24, 27, 21],
+        "Origin": ["USA", "USA", "USA", "Europe", "Europe", "Japan"],
+    }
+)
+bindings_chart = (
+    alt.Chart(df_bindings)
+    .mark_point()
+    .encode(
+        x="Horsepower:Q",
+        y="Miles_per_Gallon:Q",
+        color="Origin:N",
+    )
+    .add_params(
+        alt.param(
+            name="year",
+            value=1975,
+            bind=alt.binding_range(min=1970, max=1980, step=1, name="Year"),
+        ),
+        alt.param(
+            name="origin",
+            value="USA",
+            bind=alt.binding_select(options=["USA", "Europe", "Japan"], name="Origin"),
+        ),
+        alt.param(
+            name="cylinders",
+            value=4,
+            bind=alt.binding_radio(options=[4, 6, 8], name="Cylinders"),
+        ),
+        alt.param(
+            name="filled",
+            value=True,
+            bind=alt.binding_checkbox(name="Filled"),
+        ),
+        alt.param(
+            name="search",
+            value="",
+            bind=alt.binding(input="text", name="Search"),
+        ),
+    )
+    .properties(width=400, height=200)
+)
+with st.container(key="altair_chart_bindings"):
+    st.altair_chart(bindings_chart, theme="streamlit", width="content")
+
+# Local GeoJSON assets only — URL data must not fetch a CDN.
+GEOJSON_PATH = STATIC_DIR / "two_polygons.geo.json"
+GEOJSON_URL = "./app/static/two_polygons.geo.json"
+GEO_FORMAT = alt.DataFormat(property="features", type="json")
+
+with st.container(key="altair_geoshape_lookup"):
+    population = pd.DataFrame({"id": [1, 2], "population": [100, 200]})
+    lookup_chart = (
+        alt.Chart(alt.Data(url=GEOJSON_URL, format=GEO_FORMAT))
+        .mark_geoshape()
+        .encode(color="population:Q")
+        .transform_lookup(
+            lookup="id",
+            from_=alt.LookupData(population, "id", list(population.columns)),
+        )
+        .project(type="identity", reflectY=True)
+        .properties(width=400, height=200)
+    )
+    st.altair_chart(lookup_chart, width="content")
+
+with st.container(key="altair_geoshape_inline"):
+    inline_chart = (
+        alt.Chart(
+            alt.InlineData(
+                values=json.loads(GEOJSON_PATH.read_text()),
+                format=GEO_FORMAT,
+            )
+        )
+        .mark_geoshape()
+        .encode(color="properties.name:N")
+        .project(type="identity", reflectY=True)
+        .properties(width=400, height=200)
+    )
+    st.altair_chart(inline_chart, width="content")
+
+# Keep accessible-name cases last because existing E2E assertions use positional
+# chart indexes.
+_a11y_df = pd.DataFrame({"a": ["A", "B"], "b": [1, 2]})
+_a11y_chart = alt.Chart(_a11y_df).mark_bar().encode(x="a", y="b")
+
+with st.container(key="altair_alt"):
+    st.altair_chart(_a11y_chart, alt="Bar chart of categories A and B", width="content")
+
+with st.container(key="altair_no_alt"):
+    st.altair_chart(_a11y_chart, width="content")
+
+with st.container(key="altair_alt_overrides_description"):
+    st.altair_chart(
+        _a11y_chart.properties(description="Altair description"),
+        alt="Streamlit alt overrides description",
+        width="content",
+    )
+
+# Large-data defaults: more than 2,000 points render to canvas, and marks for
+# more than 5,000 rows skip their ARIA descriptions.
+_dense_rng = np.random.default_rng(3)
+_dense_points = pd.DataFrame(
+    {"x": _dense_rng.standard_normal(2001), "y": _dense_rng.standard_normal(2001)}
+)
+_dense_point_chart = alt.Chart(_dense_points).mark_point().encode(x="x:Q", y="y:Q")
+
+with st.container(key="altair_dense_points"):
+    st.altair_chart(_dense_point_chart, alt="Dense point cloud")
+
+with st.container(key="altair_dense_points_svg"):
+    st.altair_chart(
+        _dense_point_chart.properties(usermeta={"embedOptions": {"renderer": "svg"}})
+    )
+
+_dense_walk = pd.DataFrame(
+    {"x": np.arange(5001), "y": np.cumsum(_dense_rng.standard_normal(5001))}
+)
+with st.container(key="altair_dense_line"):
+    st.altair_chart(
+        alt.Chart(_dense_walk).mark_line().encode(x="x:Q", y="y:Q"),
+        alt="Dense random walk",
+    )
