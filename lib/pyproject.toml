@@ -71,7 +71,7 @@ dependencies = [
   # pandas 1.5.0–1.5.2 expose the dataframe interchange `Column.size` as an
   # attribute instead of a method, which crashes interchange conversion of
   # string columns.
-  "pandas>=1.5.3,<4",
+  "pandas>=3.1.1,<4",
   # 9.2.0 is the first release that publishes Python 3.11 wheels.
   "pillow>=9.2.0,<14",
   "pydeck>=0.8.0b4,<1",
