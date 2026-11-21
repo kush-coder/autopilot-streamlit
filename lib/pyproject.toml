@@ -99,7 +99,7 @@ dependencies = [
   # Required by starlette:
   "anyio>=4.0.0,<5",
   # Required for file-upload support:
-  "python-multipart>=0.0.10,<1",
+  "python-multipart>=0.0.34,<1",
   # Required for websocket support:
   "websockets>=12.0.0,<18",
   # Required for cookie signing:
